@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import copy
 
 
-@dataclass
+@dataclass(frozen=True)
 class FilterConfig:
     """滤波器配置类
     

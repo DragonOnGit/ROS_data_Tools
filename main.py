@@ -271,6 +271,7 @@ class MainWindow(QMainWindow):
         plot_tab = QWidget()
         plot_layout = QVBoxLayout(plot_tab)
         
+        self.plot_canvas = None
         self.lbl_plot_placeholder = QLabel("请先加载数据并选择话题\n然后点击绘图按钮生成图表")
         self.lbl_plot_placeholder.setAlignment(Qt.AlignCenter)
         self.lbl_plot_placeholder.setStyleSheet("""
@@ -290,10 +291,29 @@ class MainWindow(QMainWindow):
         compare_tab = QWidget()
         compare_layout = QVBoxLayout(compare_tab)
         
+        compare_splitter = QSplitter(Qt.Vertical)
+        
         self.text_filter_report = QTextEdit()
         self.text_filter_report.setReadOnly(True)
         self.text_filter_report.setFont(QFont("Consolas", 9))
-        compare_layout.addWidget(self.text_filter_report)
+        self.text_filter_report.setMaximumHeight(250)
+        compare_splitter.addWidget(self.text_filter_report)
+        
+        self.filter_canvas = None
+        self.lbl_filter_placeholder = QLabel("应用滤波后，对比图表将在此显示")
+        self.lbl_filter_placeholder.setAlignment(Qt.AlignCenter)
+        self.lbl_filter_placeholder.setStyleSheet("""
+            QLabel {
+                font-size: 13px;
+                color: #666666;
+                padding: 15px;
+                background-color: #f5f5f5;
+                border-radius: 8px;
+            }
+        """)
+        compare_splitter.addWidget(self.lbl_filter_placeholder)
+        
+        compare_layout.addWidget(compare_splitter)
         
         self.tab_widget.addTab(compare_tab, "🔍 滤波对比")
         
@@ -525,7 +545,8 @@ class MainWindow(QMainWindow):
                 for i in range(self.list_topics.count()):
                     item = self.list_topics.item(i)
                     if item.data(Qt.UserRole) == topic_name:
-                        self.list_topics.setItemSelected(item, True)
+                        item.setSelected(True)
+                        self.list_topics.setCurrentItem(item)
                         break
                 
                 QMessageBox.information(
@@ -634,6 +655,10 @@ class MainWindow(QMainWindow):
             # 显示完整报告
             full_report = "\n".join(report_lines)
             self.text_filter_report.setText(full_report)
+            
+            # 在滤波对比选项卡中显示对比图表
+            self._display_filter_comparison_chart()
+            
             self.tab_widget.setCurrentIndex(2)  # 切换到滤波对比标签页
             
             self.statusBar().showMessage(f"已完成滤波处理 - {filter_name}")
@@ -642,7 +667,7 @@ class MainWindow(QMainWindow):
                 self,
                 "滤波完成",
                 f"已对所有选中的话题应用 {filter_name} 滤波器。\n\n"
-                f"请在'滤波对比'标签页查看详细效果。",
+                f"请在'滤波对比'标签页查看详细效果和对比图表。",
                 QMessageBox.Ok
             )
             
@@ -653,6 +678,97 @@ class MainWindow(QMainWindow):
                 f"应用滤波器时发生错误:\n{str(e)}",
                 QMessageBox.Ok
             )
+    
+    def _display_filter_comparison_chart(self):
+        """在滤波对比选项卡中显示对比图表
+        
+        生成滤波前后数据对比的matplotlib图表，
+        并嵌入到Qt界面的滤波对比选项卡中。
+        """
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+        from matplotlib.figure import Figure
+        
+        if not self.current_pose_data or not self.filtered_pose_data:
+            return
+        
+        # 获取滤波对比选项卡
+        compare_tab = self.tab_widget.widget(2)
+        compare_layout = compare_tab.layout()
+        
+        # 移除旧的canvas和placeholder
+        if self.filter_canvas is not None:
+            old_canvas = self.filter_canvas
+            old_toolbar = getattr(self, '_filter_toolbar', None)
+            self.filter_canvas = None
+            self._filter_toolbar = None
+            compare_layout.removeWidget(old_canvas)
+            old_canvas.deleteLater()
+            if old_toolbar is not None:
+                compare_layout.removeWidget(old_toolbar)
+                old_toolbar.deleteLater()
+        
+        if self.lbl_filter_placeholder.isVisible():
+            compare_layout.removeWidget(self.lbl_filter_placeholder)
+        
+        # 创建对比图表
+        topics = list(self.filtered_pose_data.keys())
+        n_topics = len(topics)
+        if n_topics == 0:
+            return
+        
+        # 每个话题显示3个字段(x,y,z)的对比
+        fig = Figure(figsize=(12, 4 * n_topics), dpi=100)
+        
+        for t_idx, topic_name in enumerate(topics):
+            if topic_name not in self.pose_data_dict or topic_name not in self.filtered_pose_data:
+                continue
+            
+            raw = self.current_pose_data.get(topic_name)
+            filt = self.filtered_pose_data.get(topic_name)
+            
+            if raw is None or filt is None:
+                continue
+            
+            fields = ['x', 'y', 'z']
+            for f_idx, field in enumerate(fields):
+                ax_idx = t_idx * 3 + f_idx + 1
+                ax = fig.add_subplot(n_topics, 3, ax_idx)
+                
+                raw_values = getattr(raw, field, np.array([]))
+                filt_values = getattr(filt, field, np.array([]))
+                
+                if len(raw_values) > 0 and len(filt_values) > 0:
+                    time_raw = raw.timestamp - raw.timestamp[0]
+                    min_len = min(len(raw_values), len(filt_values), len(time_raw))
+                    
+                    ax.plot(time_raw[:min_len], raw_values[:min_len], 
+                           'b-', label='原始', linewidth=1.0, alpha=0.7)
+                    ax.plot(time_raw[:min_len], filt_values[:min_len], 
+                           'r--', label='滤波', linewidth=1.0, alpha=0.7)
+                    ax.set_title(f'{topic_name} - {field.upper()}', fontsize=9)
+                    ax.grid(True, linestyle='--', alpha=0.5)
+                    ax.legend(fontsize=7, loc='upper right')
+                    ax.set_xlabel('时间 (s)', fontsize=8)
+                    
+                    if f_idx == 0:
+                        ax.set_ylabel('坐标 (m)', fontsize=8)
+        
+        fig.tight_layout()
+        
+        # 创建canvas
+        canvas = FigureCanvas(fig)
+        canvas.setMinimumHeight(300)
+        
+        # 创建导航工具栏
+        toolbar = NavigationToolbar(canvas, self)
+        toolbar.setMaximumHeight(35)
+        
+        compare_layout.insertWidget(1, toolbar)
+        compare_layout.insertWidget(2, canvas)
+        
+        self.filter_canvas = canvas
+        self._filter_toolbar = toolbar
     
     def plot_position_data(self):
         """绘制位置-时间曲线"""
@@ -705,31 +821,61 @@ class MainWindow(QMainWindow):
     def _display_figure(self, fig, title: str):
         """在界面上显示matplotlib图表
         
+        将matplotlib Figure对象嵌入到Qt界面的图表选项卡中，
+        实现图表的实时预览功能。
+        
         Args:
             fig: matplotlib Figure对象
             title: 图表标题
         """
-        # 将matplotlib图表嵌入到Qt界面需要额外的工作
-        # 这里我们采用简单的方案：保存为临时文件并提示用户查看
-        import tempfile
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
         
+        # 获取图表选项卡
+        plot_tab = self.tab_widget.widget(1)
+        plot_layout = plot_tab.layout()
+        
+        # 移除旧的canvas和placeholder
+        if self.plot_canvas is not None:
+            old_canvas = self.plot_canvas
+            old_toolbar = getattr(self, '_plot_toolbar', None)
+            self.plot_canvas = None
+            self._plot_toolbar = None
+            plot_layout.removeWidget(old_canvas)
+            old_canvas.deleteLater()
+            if old_toolbar is not None:
+                plot_layout.removeWidget(old_toolbar)
+                old_toolbar.deleteLater()
+        
+        if self.lbl_plot_placeholder.isVisible():
+            plot_layout.removeWidget(self.lbl_plot_placeholder)
+        
+        # 创建新的canvas
+        canvas = FigureCanvas(fig)
+        canvas.setMinimumHeight(400)
+        
+        # 创建导航工具栏（支持缩放、平移、保存等操作）
+        toolbar = NavigationToolbar(canvas, self)
+        toolbar.setMaximumHeight(35)
+        
+        # 添加到布局
+        plot_layout.insertWidget(0, toolbar)
+        plot_layout.insertWidget(1, canvas)
+        
+        self.plot_canvas = canvas
+        self._plot_toolbar = toolbar
+        
+        # 切换到图表标签页
+        self.tab_widget.setCurrentIndex(1)
+        self.statusBar().showMessage(f"图表已生成: {title}")
+        
+        # 同时保存临时文件
         temp_dir = './temp_plots'
         if not os.path.exists(temp_dir):
             os.makedirs(temp_dir)
-        
         safe_title = title.replace(' ', '_').replace('/', '_')
         temp_path = os.path.join(temp_dir, f'{safe_title}.png')
-        
         fig.savefig(temp_path, dpi=150, bbox_inches='tight')
-        
-        self.tab_widget.setCurrentIndex(1)  # 切换到图表标签页
-        self.lbl_plot_placeholder.setText(
-            f"图表已生成!\n\n"
-            f"标题: {title}\n"
-            f"保存位置: {temp_path}\n\n"
-            f"提示: 点击'保存所有图表'可导出高清版本"
-        )
-        self.statusBar().showMessage(f"图表已生成: {title}")
     
     def export_data(self):
         """导出数据为CSV文件"""

@@ -24,95 +24,87 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QFont
 
-# 导入自定义模块
 from bag_parser import BagParser, TopicInfo, PoseData
 from data_visualizer import DataVisualizer
 from filter_processor import FilterProcessor, FilterConfig
 
+import matplotlib
+matplotlib.use('Qt5Agg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+
+# Configure Chinese font support
+_font_candidates = ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei',
+                    'Noto Sans CJK SC', 'PingFang SC', 'Heiti SC',
+                    'STHeiti', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['font.sans-serif'] = _font_candidates
+plt.rcParams['axes.unicode_minus'] = False
+
 
 class BagLoadingThread(QThread):
-    """Bag文件加载线程
-    
-    在后台线程中加载和解析bag文件，避免阻塞UI。
-    """
-    loading_finished = pyqtSignal(object)  # 加载完成信号
-    error_occurred = pyqtSignal(str)       # 错误信号
-    progress_update = pyqtSignal(str)      # 进度更新信号
+    """Bag文件加载线程"""
+    loading_finished = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
+    progress_update = pyqtSignal(str)
     
     def __init__(self, bag_path: str):
         super().__init__()
         self.bag_path = bag_path
     
     def run(self):
-        """执行bag文件解析"""
         try:
             self.progress_update.emit("正在初始化解析器...")
             parser = BagParser(self.bag_path)
-            
             self.progress_update.emit("正在读取bag文件...")
             topics_info = parser.parse_bag()
-            
             self.loading_finished.emit(parser)
-            
         except Exception as e:
             self.error_occurred.emit(f"加载失败: {str(e)}")
 
 
 class MainWindow(QMainWindow):
-    """主窗口类
-    
-    提供完整的GUI界面，包含：
-    - 文件操作功能（打开、保存、导出）
-    - 话题浏览与选择
-    - 数据可视化展示
-    - 滤波处理功能
-    - 数据修改工具
-    """
+    """主窗口类"""
     
     def __init__(self):
         super().__init__()
         
-        # 初始化组件
-        self.parser: Optional[BagParser] = None
+        self.parser = None
         self.visualizer = DataVisualizer()
         self.filter_processor = FilterProcessor()
-        self.current_pose_data: Dict[str, PoseData] = {}
-        self.filtered_pose_data: Dict[str, PoseData] = {}
+        self.current_pose_data = {}
+        self.filtered_pose_data = {}
         
-        # 设置窗口属性
+        self.plot_canvas = None
+        self._plot_toolbar = None
+        self.filter_canvas = None
+        self._filter_toolbar = None
+        
         self.setWindowTitle("ROS Bag数据分析与可视化系统")
         self.setGeometry(100, 100, 1400, 900)
         self.setMinimumSize(1200, 700)
         
-        # 初始化UI
         self._setup_ui()
         self._create_menu_bar()
         self._create_status_bar()
-        self._connect_signals()
     
     def _setup_ui(self):
-        """设置用户界面"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
         main_layout = QHBoxLayout(central_widget)
         
-        # 左侧面板：控制区
         left_panel = self._create_left_panel()
-        
-        # 右侧面板：显示区
         right_panel = self._create_right_panel()
         
-        # 使用分割器
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([350, 1050])  # 初始比例
+        splitter.setSizes([350, 1050])
         
         main_layout.addWidget(splitter)
     
     def _create_left_panel(self) -> QWidget:
-        """创建左侧控制面板"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setSpacing(10)
@@ -228,6 +220,21 @@ class MainWindow(QMainWindow):
         btn_plot_dashboard = QPushButton("🎛️ 综合仪表板")
         btn_plot_dashboard.clicked.connect(self.plot_dashboard)
         
+        btn_clear_curves = QPushButton("🗑️ 清除曲线")
+        btn_clear_curves.setMinimumHeight(30)
+        btn_clear_curves.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c;
+                color: white;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #c0392b;
+            }
+        """)
+        btn_clear_curves.clicked.connect(self.clear_all_curves)
+        
         btn_export_data = QPushButton("💾 导出数据(CSV)")
         btn_export_data.clicked.connect(self.export_data)
         
@@ -238,22 +245,19 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(btn_plot_orientation)
         action_layout.addWidget(btn_plot_trajectory)
         action_layout.addWidget(btn_plot_dashboard)
+        action_layout.addWidget(btn_clear_curves)
         action_layout.addWidget(btn_export_data)
         action_layout.addWidget(btn_save_plots)
         
         layout.addWidget(action_group)
-        
-        # 添加弹性空间
         layout.addStretch()
         
         return panel
     
     def _create_right_panel(self) -> QWidget:
-        """创建右侧显示面板"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         
-        # 创建选项卡控件
         self.tab_widget = QTabWidget()
         
         # === 信息显示标签页 ===
@@ -268,10 +272,9 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(info_tab, "📝 信息")
         
         # === 图表显示标签页 ===
-        plot_tab = QWidget()
-        plot_layout = QVBoxLayout(plot_tab)
+        self.plot_tab = QWidget()
+        self.plot_tab_layout = QVBoxLayout(self.plot_tab)
         
-        self.plot_canvas = None
         self.lbl_plot_placeholder = QLabel("请先加载数据并选择话题\n然后点击绘图按钮生成图表")
         self.lbl_plot_placeholder.setAlignment(Qt.AlignCenter)
         self.lbl_plot_placeholder.setStyleSheet("""
@@ -283,13 +286,13 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
             }
         """)
-        plot_layout.addWidget(self.lbl_plot_placeholder)
+        self.plot_tab_layout.addWidget(self.lbl_plot_placeholder)
         
-        self.tab_widget.addTab(plot_tab, "📊 图表")
+        self.tab_widget.addTab(self.plot_tab, "📊 图表")
         
         # === 滤波对比标签页 ===
-        compare_tab = QWidget()
-        compare_layout = QVBoxLayout(compare_tab)
+        self.compare_tab = QWidget()
+        self.compare_tab_layout = QVBoxLayout(self.compare_tab)
         
         compare_splitter = QSplitter(Qt.Vertical)
         
@@ -299,7 +302,10 @@ class MainWindow(QMainWindow):
         self.text_filter_report.setMaximumHeight(250)
         compare_splitter.addWidget(self.text_filter_report)
         
-        self.filter_canvas = None
+        self.filter_chart_container = QWidget()
+        self.filter_chart_layout = QVBoxLayout(self.filter_chart_container)
+        self.filter_chart_layout.setContentsMargins(0, 0, 0, 0)
+        
         self.lbl_filter_placeholder = QLabel("应用滤波后，对比图表将在此显示")
         self.lbl_filter_placeholder.setAlignment(Qt.AlignCenter)
         self.lbl_filter_placeholder.setStyleSheet("""
@@ -311,21 +317,21 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
             }
         """)
-        compare_splitter.addWidget(self.lbl_filter_placeholder)
+        self.filter_chart_layout.addWidget(self.lbl_filter_placeholder)
         
-        compare_layout.addWidget(compare_splitter)
+        compare_splitter.addWidget(self.filter_chart_container)
         
-        self.tab_widget.addTab(compare_tab, "🔍 滤波对比")
+        self.compare_tab_layout.addWidget(compare_splitter)
+        
+        self.tab_widget.addTab(self.compare_tab, "🔍 滤波对比")
         
         layout.addWidget(self.tab_widget)
         
         return panel
     
     def _create_menu_bar(self):
-        """创建菜单栏"""
         menubar = self.menuBar()
         
-        # 文件菜单
         file_menu = menubar.addMenu("文件(&F)")
         
         open_action = QAction("打开Bag文件...", self)
@@ -352,7 +358,6 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         
-        # 视图菜单
         view_menu = menubar.addMenu("视图(&V)")
         
         pos_view_action = QAction("位置-时间曲线", self)
@@ -371,7 +376,11 @@ class MainWindow(QMainWindow):
         dashboard_action.triggered.connect(self.plot_dashboard)
         view_menu.addAction(dashboard_action)
         
-        # 帮助菜单
+        view_menu.addSeparator()
+        clear_action = QAction("清除所有曲线", self)
+        clear_action.triggered.connect(self.clear_all_curves)
+        view_menu.addAction(clear_action)
+        
         help_menu = menubar.addMenu("帮助(&H)")
         
         about_action = QAction("关于...", self)
@@ -379,19 +388,110 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
     
     def _create_status_bar(self):
-        """创建状态栏"""
         self.statusBar().showMessage("就绪 - 请打开一个.bag文件开始分析")
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress_bar)
     
-    def _connect_signals(self):
-        """连接信号和槽"""
-        pass  # 已在各处使用connect绑定
+    # ==================== Data Clearing ====================
+    
+    def _clear_all_data(self):
+        """清除所有已加载的数据、缓存和图表
+        
+        在重新加载bag文件时调用，确保工作区完全重置。
+        """
+        # 清除位姿数据
+        self.current_pose_data.clear()
+        self.filtered_pose_data.clear()
+        
+        # 清除可视化器数据
+        self.visualizer.clear_all_data()
+        
+        # 清除滤波处理器历史
+        self.filter_processor.filter_history.clear()
+        self.filter_processor.last_config = None
+        
+        # 清除图表canvas
+        self._clear_plot_canvas()
+        self._clear_filter_canvas()
+        
+        # 清除文本报告
+        self.text_filter_report.clear()
+        
+        # 重置信息显示
+        self.text_info.clear()
+        
+        print("✅ 所有数据已清除，工作区已重置")
+    
+    def _clear_plot_canvas(self):
+        """清除图表选项卡中的canvas"""
+        if self.plot_canvas is not None:
+            self.plot_tab_layout.removeWidget(self.plot_canvas)
+            self.plot_canvas.deleteLater()
+            self.plot_canvas = None
+        if self._plot_toolbar is not None:
+            self.plot_tab_layout.removeWidget(self._plot_toolbar)
+            self._plot_toolbar.deleteLater()
+            self._plot_toolbar = None
+        
+        # 恢复placeholder
+        if self.lbl_plot_placeholder.parent() is None:
+            self.plot_tab_layout.addWidget(self.lbl_plot_placeholder)
+        self.lbl_plot_placeholder.show()
+        self.lbl_plot_placeholder.setText("请先加载数据并选择话题\n然后点击绘图按钮生成图表")
+    
+    def _clear_filter_canvas(self):
+        """清除滤波对比选项卡中的canvas"""
+        if self.filter_canvas is not None:
+            self.filter_chart_layout.removeWidget(self.filter_canvas)
+            self.filter_canvas.deleteLater()
+            self.filter_canvas = None
+        if self._filter_toolbar is not None:
+            self.filter_chart_layout.removeWidget(self._filter_toolbar)
+            self._filter_toolbar.deleteLater()
+            self._filter_toolbar = None
+        
+        if self.lbl_filter_placeholder.parent() is None:
+            self.filter_chart_layout.addWidget(self.lbl_filter_placeholder)
+        self.lbl_filter_placeholder.show()
+        self.lbl_filter_placeholder.setText("应用滤波后，对比图表将在此显示")
+    
+    def clear_all_curves(self):
+        """清除当前图窗中所有已绘制的曲线"""
+        # 清除可视化器中存储的所有数据和图表
+        self.visualizer.clear_all_data()
+        
+        # 清除当前位姿数据
+        self.current_pose_data.clear()
+        self.filtered_pose_data.clear()
+        
+        # 清除滤波历史
+        self.filter_processor.filter_history.clear()
+        self.filter_processor.last_config = None
+        
+        # 清除图表canvas
+        self._clear_plot_canvas()
+        self._clear_filter_canvas()
+        
+        # 清除文本报告
+        self.text_filter_report.clear()
+        
+        self.statusBar().showMessage("✅ 所有曲线和数据已清除")
+        self.tab_widget.setCurrentIndex(0)
+        
+        QMessageBox.information(
+            self,
+            "清除完成",
+            "所有曲线数据已彻底清除！\n\n"
+            "包括：已加载的位姿数据、滤波结果、图表曲线。\n"
+            "您可以重新选择话题并绘制新图表。",
+            QMessageBox.Ok
+        )
+    
+    # ==================== File Operations ====================
     
     def open_bag_file(self):
-        """打开并加载bag文件"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择ROS Bag文件",
@@ -403,17 +503,14 @@ class MainWindow(QMainWindow):
             self.load_bag_file(file_path)
     
     def load_bag_file(self, file_path: str):
-        """加载指定的bag文件
+        # 重新加载时先清除所有旧数据
+        self._clear_all_data()
         
-        Args:
-            file_path (str): bag文件的完整路径
-        """
         self.lbl_current_file.setText(f"正在加载:\n{file_path}")
         self.statusBar().showMessage(f"正在加载: {os.path.basename(file_path)}...")
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # 不确定进度
+        self.progress_bar.setRange(0, 0)
         
-        # 启动后台线程加载
         self.loading_thread = BagLoadingThread(file_path)
         self.loading_thread.loading_finished.connect(self.on_bag_loaded)
         self.loading_thread.error_occurred.connect(self.on_load_error)
@@ -423,18 +520,12 @@ class MainWindow(QMainWindow):
         self.loading_thread.start()
     
     def on_bag_loaded(self, parser: BagParser):
-        """bag文件加载完成的回调函数
-        
-        Args:
-            parser: 已完成解析的BagParser对象
-        """
         self.parser = parser
         self.progress_bar.setVisible(False)
         
-        # 更新文件信息显示
         self.lbl_current_file.setText(f"已加载:\n{parser.bag_file_path}")
         self.statusBar().showMessage(
-            f"加载完成 - 发现 {len(parser.topics_info)} 个话题"
+            f"加载完成 - 发现 {len(parser.topics_info)} 个话题（旧数据已清除）"
         )
         
         # 更新话题列表
@@ -445,58 +536,41 @@ class MainWindow(QMainWindow):
             item = self.list_topics.item(self.list_topics.count() - 1)
             item.setData(Qt.UserRole, topic_name)
         
-        # 显示统计报告
         report = parser.get_statistics_report()
         self.text_info.setText(report)
         
-        # 切换到信息标签页
         self.tab_widget.setCurrentIndex(0)
         
         QMessageBox.information(
             self,
             "加载成功",
-            f"成功加载bag文件！\n\n发现 {len(parser.topics_info)} 个话题",
+            f"成功加载bag文件！\n\n"
+            f"发现 {len(parser.topics_info)} 个话题\n\n"
+            f"提示：之前的数据已全部清除，可放心使用新数据。",
             QMessageBox.Ok
         )
     
     def on_load_error(self, error_msg: str):
-        """加载错误回调"""
         self.progress_bar.setVisible(False)
         self.statusBar().showMessage("加载失败")
         self.lbl_current_file.setText("加载失败")
         
-        QMessageBox.critical(
-            self,
-            "加载错误",
-            error_msg,
-            QMessageBox.Ok
-        )
+        QMessageBox.critical(self, "加载错误", error_msg, QMessageBox.Ok)
+    
+    # ==================== Topic Selection ====================
     
     def on_topic_selection_changed(self):
-        """话题选择改变时的处理"""
         selected_items = self.list_topics.selectedItems()
         if selected_items:
-            topics_text = "\n".join([item.data(Qt.UserRole) for item in selected_items])
             self.statusBar().showMessage(f"已选择 {len(selected_items)} 个话题")
         else:
             self.statusBar().showMessage("未选择任何话题")
     
     def select_target_topic(self, topic_name: str):
-        """选择并提取目标话题的数据
-        
-        Args:
-            topic_name (str): 目标话题名称
-        """
         if not self.parser:
-            QMessageBox.warning(
-                self,
-                "提示",
-                "请先加载bag文件！",
-                QMessageBox.Ok
-            )
+            QMessageBox.warning(self, "提示", "请先加载bag文件！", QMessageBox.Ok)
             return
         
-        # 检查话题是否存在
         if topic_name not in self.parser.get_topic_names():
             available = ", ".join(self.parser.get_topic_names()[:5])
             QMessageBox.warning(
@@ -508,18 +582,15 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            # 提取位姿数据
             pose_data = self.parser.extract_pose_data(topic_name)
             
             if pose_data and len(pose_data.timestamp) > 0:
                 self.current_pose_data[topic_name] = pose_data
                 self.visualizer.add_pose_data(topic_name, pose_data, 'raw')
                 
-                # 清除该话题的旧滤波数据
                 if topic_name in self.filtered_pose_data:
                     del self.filtered_pose_data[topic_name]
                 
-                # 更新信息显示
                 info_text = (
                     f"话题: {topic_name}\n"
                     f"{'='*40}\n\n"
@@ -541,7 +612,6 @@ class MainWindow(QMainWindow):
                     f"已提取 '{topic_name}' 的位姿数据 ({len(pose_data.timestamp)} 个点)"
                 )
                 
-                # 自动选中列表中的该项
                 for i in range(self.list_topics.count()):
                     item = self.list_topics.item(i)
                     if item.data(Qt.UserRole) == topic_name:
@@ -569,18 +639,12 @@ class MainWindow(QMainWindow):
                 
         except Exception as e:
             QMessageBox.critical(
-                self,
-                "错误",
-                f"提取数据时发生错误:\n{str(e)}",
-                QMessageBox.Ok
+                self, "错误", f"提取数据时发生错误:\n{str(e)}", QMessageBox.Ok
             )
     
+    # ==================== Filter Operations ====================
+    
     def get_current_filter_config(self) -> FilterConfig:
-        """从UI获取当前滤波配置
-        
-        Returns:
-            FilterConfig: 当前设置的滤波器配置
-        """
         type_map = {
             0: 'moving_average',
             1: 'weighted_moving_average',
@@ -603,13 +667,9 @@ class MainWindow(QMainWindow):
         return config
     
     def apply_filter_to_selected(self):
-        """对选中的话题应用当前滤波器设置"""
         if not self.current_pose_data:
             QMessageBox.warning(
-                self,
-                "提示",
-                "请先选择并提取至少一个话题的位姿数据！",
-                QMessageBox.Ok
+                self, "提示", "请先选择并提取至少一个话题的位姿数据！", QMessageBox.Ok
             )
             return
         
@@ -622,16 +682,13 @@ class MainWindow(QMainWindow):
             for topic_name, pose_data in self.current_pose_data.items():
                 print(f"\n正在对 '{topic_name}' 应用 {filter_name} 滤波...")
                 
-                # 应用滤波
                 filtered_pose = self.filter_processor.apply_filter_to_pose_data(
                     pose_data, config
                 )
                 
-                # 存储结果
                 self.filtered_pose_data[topic_name] = filtered_pose
                 self.visualizer.add_pose_data(topic_name, filtered_pose, 'filtered')
                 
-                # 生成对比报告
                 fields = ['x', 'y', 'z']
                 report_lines.append(f"\n话题: {topic_name}")
                 report_lines.append("-" * 40)
@@ -652,15 +709,12 @@ class MainWindow(QMainWindow):
                             f"\n    相关性: {stats.get('correlation', 0):.4f}"
                         )
             
-            # 显示完整报告
             full_report = "\n".join(report_lines)
             self.text_filter_report.setText(full_report)
             
-            # 在滤波对比选项卡中显示对比图表
             self._display_filter_comparison_chart()
             
-            self.tab_widget.setCurrentIndex(2)  # 切换到滤波对比标签页
-            
+            self.tab_widget.setCurrentIndex(2)
             self.statusBar().showMessage(f"已完成滤波处理 - {filter_name}")
             
             QMessageBox.information(
@@ -672,58 +726,40 @@ class MainWindow(QMainWindow):
             )
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             QMessageBox.critical(
-                self,
-                "滤波错误",
-                f"应用滤波器时发生错误:\n{str(e)}",
-                QMessageBox.Ok
+                self, "滤波错误", f"应用滤波器时发生错误:\n{str(e)}", QMessageBox.Ok
             )
     
     def _display_filter_comparison_chart(self):
-        """在滤波对比选项卡中显示对比图表
-        
-        生成滤波前后数据对比的matplotlib图表，
-        并嵌入到Qt界面的滤波对比选项卡中。
-        """
-        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-        from matplotlib.figure import Figure
-        
+        """在滤波对比选项卡中显示对比图表"""
         if not self.current_pose_data or not self.filtered_pose_data:
             return
         
-        # 获取滤波对比选项卡
-        compare_tab = self.tab_widget.widget(2)
-        compare_layout = compare_tab.layout()
-        
-        # 移除旧的canvas和placeholder
+        # 清除旧的canvas
         if self.filter_canvas is not None:
-            old_canvas = self.filter_canvas
-            old_toolbar = getattr(self, '_filter_toolbar', None)
+            self.filter_chart_layout.removeWidget(self.filter_canvas)
+            self.filter_canvas.deleteLater()
             self.filter_canvas = None
+        if self._filter_toolbar is not None:
+            self.filter_chart_layout.removeWidget(self._filter_toolbar)
+            self._filter_toolbar.deleteLater()
             self._filter_toolbar = None
-            compare_layout.removeWidget(old_canvas)
-            old_canvas.deleteLater()
-            if old_toolbar is not None:
-                compare_layout.removeWidget(old_toolbar)
-                old_toolbar.deleteLater()
         
-        if self.lbl_filter_placeholder.isVisible():
-            compare_layout.removeWidget(self.lbl_filter_placeholder)
+        self.lbl_filter_placeholder.hide()
         
-        # 创建对比图表
         topics = list(self.filtered_pose_data.keys())
         n_topics = len(topics)
         if n_topics == 0:
             return
         
-        # 每个话题显示3个字段(x,y,z)的对比
         fig = Figure(figsize=(12, 4 * n_topics), dpi=100)
         
+        # Apply Chinese font to the figure
+        fig.set_facecolor('white')
+        
         for t_idx, topic_name in enumerate(topics):
-            if topic_name not in self.pose_data_dict or topic_name not in self.filtered_pose_data:
-                continue
-            
             raw = self.current_pose_data.get(topic_name)
             filt = self.filtered_pose_data.get(topic_name)
             
@@ -756,26 +792,24 @@ class MainWindow(QMainWindow):
         
         fig.tight_layout()
         
-        # 创建canvas
         canvas = FigureCanvas(fig)
         canvas.setMinimumHeight(300)
         
-        # 创建导航工具栏
         toolbar = NavigationToolbar(canvas, self)
         toolbar.setMaximumHeight(35)
         
-        compare_layout.insertWidget(1, toolbar)
-        compare_layout.insertWidget(2, canvas)
+        self.filter_chart_layout.addWidget(toolbar)
+        self.filter_chart_layout.addWidget(canvas)
         
         self.filter_canvas = canvas
         self._filter_toolbar = toolbar
     
+    # ==================== Plot Operations ====================
+    
     def plot_position_data(self):
-        """绘制位置-时间曲线"""
         if not self.current_pose_data:
             self._show_no_data_warning()
             return
-        
         try:
             fig = self.visualizer.plot_position_time(show_filtered=True)
             self._display_figure(fig, "位置数据曲线")
@@ -783,11 +817,9 @@ class MainWindow(QMainWindow):
             self._show_error_dialog("绘制图表错误", str(e))
     
     def plot_orientation_data(self):
-        """绘制姿态-时间曲线"""
         if not self.current_pose_data:
             self._show_no_data_warning()
             return
-        
         try:
             fig = self.visualizer.plot_orientation_time(show_filtered=True)
             self._display_figure(fig, "姿态数据曲线")
@@ -795,11 +827,9 @@ class MainWindow(QMainWindow):
             self._show_error_dialog("绘制图表错误", str(e))
     
     def plot_2d_trajectory(self):
-        """绘制2D轨迹图"""
         if not self.current_pose_data:
             self._show_no_data_warning()
             return
-        
         try:
             fig = self.visualizer.plot_2d_trajectory(show_filtered=True)
             self._display_figure(fig, "2D运动轨迹")
@@ -807,11 +837,9 @@ class MainWindow(QMainWindow):
             self._show_error_dialog("绘制图表错误", str(e))
     
     def plot_dashboard(self):
-        """绘制综合仪表板"""
         if not self.current_pose_data:
             self._show_no_data_warning()
             return
-        
         try:
             fig = self.visualizer.create_dashboard()
             self._display_figure(fig, "综合仪表板")
@@ -819,57 +847,37 @@ class MainWindow(QMainWindow):
             self._show_error_dialog("绘制图表错误", str(e))
     
     def _display_figure(self, fig, title: str):
-        """在界面上显示matplotlib图表
-        
-        将matplotlib Figure对象嵌入到Qt界面的图表选项卡中，
-        实现图表的实时预览功能。
-        
-        Args:
-            fig: matplotlib Figure对象
-            title: 图表标题
-        """
-        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-        
-        # 获取图表选项卡
-        plot_tab = self.tab_widget.widget(1)
-        plot_layout = plot_tab.layout()
-        
-        # 移除旧的canvas和placeholder
+        """在界面上显示matplotlib图表，嵌入到Qt界面的图表选项卡中"""
+        # 清除旧的canvas
         if self.plot_canvas is not None:
-            old_canvas = self.plot_canvas
-            old_toolbar = getattr(self, '_plot_toolbar', None)
+            self.plot_tab_layout.removeWidget(self.plot_canvas)
+            self.plot_canvas.deleteLater()
             self.plot_canvas = None
+        if self._plot_toolbar is not None:
+            self.plot_tab_layout.removeWidget(self._plot_toolbar)
+            self._plot_toolbar.deleteLater()
             self._plot_toolbar = None
-            plot_layout.removeWidget(old_canvas)
-            old_canvas.deleteLater()
-            if old_toolbar is not None:
-                plot_layout.removeWidget(old_toolbar)
-                old_toolbar.deleteLater()
         
-        if self.lbl_plot_placeholder.isVisible():
-            plot_layout.removeWidget(self.lbl_plot_placeholder)
+        # 隐藏placeholder
+        self.lbl_plot_placeholder.hide()
         
         # 创建新的canvas
         canvas = FigureCanvas(fig)
         canvas.setMinimumHeight(400)
         
-        # 创建导航工具栏（支持缩放、平移、保存等操作）
         toolbar = NavigationToolbar(canvas, self)
         toolbar.setMaximumHeight(35)
         
-        # 添加到布局
-        plot_layout.insertWidget(0, toolbar)
-        plot_layout.insertWidget(1, canvas)
+        self.plot_tab_layout.insertWidget(0, toolbar)
+        self.plot_tab_layout.insertWidget(1, canvas)
         
         self.plot_canvas = canvas
         self._plot_toolbar = toolbar
         
-        # 切换到图表标签页
         self.tab_widget.setCurrentIndex(1)
         self.statusBar().showMessage(f"图表已生成: {title}")
         
-        # 同时保存临时文件
+        # 保存临时文件
         temp_dir = './temp_plots'
         if not os.path.exists(temp_dir):
             os.makedirs(temp_dir)
@@ -877,105 +885,82 @@ class MainWindow(QMainWindow):
         temp_path = os.path.join(temp_dir, f'{safe_title}.png')
         fig.savefig(temp_path, dpi=150, bbox_inches='tight')
     
+    # ==================== Export Operations ====================
+    
     def export_data(self):
-        """导出数据为CSV文件"""
         if not self.parser:
             QMessageBox.warning(self, "提示", "请先加载bag文件！", QMessageBox.Ok)
             return
         
         output_dir = QFileDialog.getExistingDirectory(
-            self,
-            "选择导出目录",
-            "./exported_data"
+            self, "选择导出目录", "./exported_data"
         )
         
         if output_dir:
             success = self.parser.export_topics_to_csv(output_dir)
             if success:
                 QMessageBox.information(
-                    self,
-                    "导出成功",
-                    f"数据已成功导出至:\n{output_dir}",
-                    QMessageBox.Ok
+                    self, "导出成功", f"数据已成功导出至:\n{output_dir}", QMessageBox.Ok
                 )
             else:
                 QMessageBox.critical(
-                    self,
-                    "导出失败",
-                    "导出过程中出现错误，请检查日志。",
-                    QMessageBox.Ok
+                    self, "导出失败", "导出过程中出现错误，请检查日志。", QMessageBox.Ok
                 )
     
     def save_all_plots(self):
-        """保存所有生成的图表"""
         if not self.visualizer.figures:
             QMessageBox.information(
-                self,
-                "提示",
-                "暂无图表可保存。请先生成一些图表。",
-                QMessageBox.Ok
+                self, "提示", "暂无图表可保存。请先生成一些图表。", QMessageBox.Ok
             )
             return
         
         output_dir = QFileDialog.getExistingDirectory(
-            self,
-            "选择保存目录",
-            "./plots"
+            self, "选择保存目录", "./plots"
         )
         
         if output_dir:
             saved_files = self.visualizer.save_all_plots(output_dir)
-            
             QMessageBox.information(
-                self,
-                "保存成功",
-                f"已保存 {len(saved_files)} 个图表至:\n{output_dir}",
+                self, "保存成功", f"已保存 {len(saved_files)} 个图表至:\n{output_dir}",
                 QMessageBox.Ok
             )
     
+    # ==================== Utility ====================
+    
     def _show_no_data_warning(self):
-        """显示无数据警告"""
         QMessageBox.warning(
-            self,
-            "无数据",
-            "请先加载bag文件并选择要分析的话题！",
-            QMessageBox.Ok
+            self, "无数据", "请先加载bag文件并选择要分析的话题！", QMessageBox.Ok
         )
     
     def _show_error_dialog(self, title: str, message: str):
-        """显示错误对话框"""
         QMessageBox.critical(self, title, message, QMessageBox.Ok)
     
     def show_about_dialog(self):
-        """显示关于对话框"""
         QMessageBox.about(
             self,
             "关于",
             "<h2>ROS Bag数据分析与可视化系统</h2>"
-            "<p>版本: 1.0.0</p>"
+            "<p>版本: 1.1.0</p>"
             "<p>功能:</p>"
             "<ul>"
             "<li>.bag文件解析与话题提取</li>"
             "<li>位姿数据可视化（位置、姿态、轨迹）</li>"
             "<li>多种滤波算法支持</li>"
             "<li>数据导出与报表生成</li>"
+            "<li>图表内嵌预览与交互</li>"
             "</ul>"
             "<p>基于Python + PyQt5 + Matplotlib开发</p>"
         )
 
 
 def main():
-    """程序主入口"""
-    # 高DPI支持
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')  # 使用Fusion风格以获得更现代的外观
-    
-    # 设置应用程序信息
+    app.setStyle('Fusion')
     app.setApplicationName("ROS Bag Analyzer")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("1.1.0")
     
     window = MainWindow()
     window.show()

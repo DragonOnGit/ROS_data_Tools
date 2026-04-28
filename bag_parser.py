@@ -357,6 +357,31 @@ class BagParser:
         """
         return self.topics_info.get(topic_name)
 
+    SUPPORTED_MSG_TYPES = [
+        'nav_msgs/Odometry',
+        'geometry_msgs/PoseStamped',
+        'geometry_msgs/PoseWithCovarianceStamped',
+        'nav_msgs/Path',
+        'geometry_msgs/Twist',
+        'geometry_msgs/TwistStamped',
+        'geometry_msgs/Vector3Stamped',
+        'sensor_msgs/Imu',
+    ]
+
+    def is_topic_supported(self, topic_name: str) -> bool:
+        """检查指定话题是否支持数据提取
+        
+        Args:
+            topic_name: 话题名称
+            
+        Returns:
+            bool: 是否支持
+        """
+        if topic_name not in self.topics_info:
+            return False
+        msg_type = self.topics_info[topic_name].msg_type
+        return msg_type in self.SUPPORTED_MSG_TYPES
+
     def extract_pose_data(self, topic_name: str) -> Optional[PoseData]:
         """从指定话题提取位姿数据
         
@@ -403,44 +428,39 @@ class BagParser:
             
             for idx, (timestamp, msg) in enumerate(messages):
                 try:
-                    # 对于rosbags后端，需要先反序列化消息
                     if self.backend == 'rosbags':
                         msg = self._deserialize_rosbags_message(msg, topic_name)
                         if msg is None:
                             error_count += 1
                             continue
                     
-                    # 检查是否为Path类型消息（需要展开所有路径点）
-                    is_path_type = hasattr(msg, 'poses') and len(msg.poses) > 0 and not hasattr(msg, 'pose')
+                    # 尝试提取位姿数据（Odometry, PoseStamped, Path等）
+                    pose = self._extract_pose_from_message(msg)
                     
-                    if is_path_type:
-                        path_poses = self._extract_poses_from_path_message(msg, timestamp)
-                        if path_poses:
-                            for ts, pos, quat in path_poses:
-                                timestamps.append(ts)
-                                positions_x.append(pos[0])
-                                positions_y.append(pos[1])
-                                positions_z.append(pos[2])
-                                quaternions_w.append(quat[0])
-                                quaternions_x.append(quat[1])
-                                quaternions_y.append(quat[2])
-                                quaternions_z.append(quat[3])
-                                success_count += 1
-                        else:
-                            error_count += 1
-                    else:
+                    if pose is not None:
+                        pos, quat = pose
                         timestamps.append(timestamp)
-                        pose = self._extract_pose_from_message(msg)
-                        
-                        if pose is not None:
-                            pos, quat = pose
-                            positions_x.append(pos[0])
-                            positions_y.append(pos[1])
-                            positions_z.append(pos[2])
-                            quaternions_w.append(quat[0])
-                            quaternions_x.append(quat[1])
-                            quaternions_y.append(quat[2])
-                            quaternions_z.append(quat[3])
+                        positions_x.append(pos[0])
+                        positions_y.append(pos[1])
+                        positions_z.append(pos[2])
+                        quaternions_w.append(quat[0])
+                        quaternions_x.append(quat[1])
+                        quaternions_y.append(quat[2])
+                        quaternions_z.append(quat[3])
+                        success_count += 1
+                    else:
+                        # 尝试提取Twist类型数据
+                        twist = self._extract_twist_from_message(msg)
+                        if twist is not None:
+                            linear, angular = twist
+                            timestamps.append(timestamp)
+                            positions_x.append(linear[0])
+                            positions_y.append(linear[1])
+                            positions_z.append(linear[2])
+                            quaternions_w.append(1.0)
+                            quaternions_x.append(angular[0])
+                            quaternions_y.append(angular[1])
+                            quaternions_z.append(angular[2])
                             success_count += 1
                         else:
                             error_count += 1
@@ -477,8 +497,16 @@ class BagParser:
             pose_data.quaternion_y = np.array(quaternions_y)
             pose_data.quaternion_z = np.array(quaternions_z)
             
-            # 将四元数转换为欧拉角
-            if len(pose_data.quaternion_w) > 0:
+            # 检查是否为Twist类型（quaternion_w全为1.0，x/y/z存储角速度）
+            msg_type = self.topics_info.get(topic_name)
+            is_twist_type = (msg_type is not None and 
+                           'Twist' in msg_type.msg_type)
+            
+            if is_twist_type:
+                pose_data.roll = np.array(quaternions_x)
+                pose_data.pitch = np.array(quaternions_y)
+                pose_data.yaw = np.array(quaternions_z)
+            elif len(pose_data.quaternion_w) > 0:
                 pose_data.roll, pose_data.pitch, pose_data.yaw = \
                     self._quaternion_to_euler(
                         pose_data.quaternion_w,
@@ -572,44 +600,31 @@ class BagParser:
         except Exception:
             return None
 
-    def _extract_poses_from_path_message(self, msg: Any, base_timestamp: float) -> List[Tuple[float, Tuple[float, ...], Tuple[float, ...]]]:
-        """从nav_msgs/Path消息中提取所有路径点的位姿数据
+    def _extract_twist_from_message(self, msg: Any) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+        """从geometry_msgs/Twist消息中提取线速度和角速度数据
         
-        每个Path消息包含多个PoseStamped路径点，需要展开为独立的数据点。
+        将线速度映射到位置字段，角速度映射到姿态字段：
+        - linear.x/y/z → x/y/z
+        - angular.x/y/z → roll/pitch/yaw
         
         Args:
-            msg: ROS Path消息对象
-            base_timestamp: 消息的基础时间戳
+            msg: ROS Twist消息对象
             
         Returns:
-            List[Tuple]: 每个元素为(timestamp, position_tuple, quaternion_tuple)
+            Optional[Tuple]: 包含(linear_tuple, angular_tuple)的元组，或None
         """
-        results = []
         try:
-            if not hasattr(msg, 'poses') or len(msg.poses) == 0:
-                return results
-            
-            n_poses = len(msg.poses)
-            for i, pose_stamped in enumerate(msg.poses):
-                pose = pose_stamped.pose
-                
-                if hasattr(pose_stamped, 'header') and hasattr(pose_stamped.header, 'stamp'):
-                    try:
-                        ts = pose_stamped.header.stamp.to_sec()
-                    except Exception:
-                        ts = base_timestamp + i * 0.01
-                else:
-                    ts = base_timestamp + i * (1.0 / max(n_poses, 1))
-                
-                position = (pose.position.x, pose.position.y, pose.position.z)
-                quaternion = (pose.orientation.w, pose.orientation.x,
-                             pose.orientation.y, pose.orientation.z)
-                results.append((ts, position, quaternion))
-                
+            if hasattr(msg, 'linear') and hasattr(msg, 'angular'):
+                linear = (msg.linear.x, msg.linear.y, msg.linear.z)
+                angular = (msg.angular.x, msg.angular.y, msg.angular.z)
+                return (linear, angular)
+            elif hasattr(msg, 'twist') and hasattr(msg.twist, 'linear'):
+                linear = (msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z)
+                angular = (msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z)
+                return (linear, angular)
+            return None
         except Exception:
-            pass
-        
-        return results
+            return None
 
     @staticmethod
     def _quaternion_to_euler(w: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -37,23 +37,10 @@ plt.rcParams['axes.unicode_minus'] = False
 
 
 class ConsoleSignaler(QObject):
-    """用于跨线程安全传递控制台文本的信号对象
-    
-    Qt的GUI操作必须在主线程执行。当后台线程（如BagLoadingThread）
-    通过print()输出日志时，不能直接操作QTextEdit，需要通过信号
-    将文本传递到主线程进行安全更新。
-    """
     text_written = pyqtSignal(str)
 
 
 class ConsoleStream(io.TextIOBase):
-    """重定向stdout/stderr到QTextEdit的流对象
-    
-    通过信号机制实现线程安全的控制台输出重定向。
-    工作线程调用write()时，文本通过信号传递到主线程，
-    由主线程的槽函数负责更新QTextEdit。
-    """
-    
     def __init__(self, signaler: ConsoleSignaler, tag: str = ''):
         super().__init__()
         self.signaler = signaler
@@ -184,19 +171,22 @@ class MainWindow(QMainWindow):
         process_layout = QVBoxLayout(process_content)
         process_layout.setSpacing(6)
         
-        target_group = QGroupBox("🎯 常用目标话题")
-        target_layout = QVBoxLayout(target_group)
-        self.target_topic_buttons = []
-        target_topics = ['/Odometry', '/path', '/path_exp',
-                        '/robot1/robot/cmd_vel', '/robot1/robot/ground_truth']
-        for topic in target_topics:
-            btn = QPushButton(topic)
-            btn.setToolTip(f"选择并提取 {topic} 的位姿数据")
-            btn.clicked.connect(lambda checked, t=topic: self.select_target_topic(t))
-            target_layout.addWidget(btn)
-            self.target_topic_buttons.append(btn)
-        process_layout.addWidget(target_group)
+        # --- 话题数据提取 ---
+        topics_group = QGroupBox("📋 话题数据提取")
+        topics_btn_layout = QVBoxLayout(topics_group)
+        self.topics_btn_container = QWidget()
+        self.topics_btn_layout = QVBoxLayout(self.topics_btn_container)
+        self.topics_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.topics_btn_layout.setSpacing(3)
+        self._topic_buttons = []
+        no_file_label = QLabel("请先加载bag文件")
+        no_file_label.setAlignment(Qt.AlignCenter)
+        no_file_label.setStyleSheet("color: #999; font-style: italic;")
+        self.topics_btn_layout.addWidget(no_file_label)
+        topics_btn_layout.addWidget(self.topics_btn_container)
+        process_layout.addWidget(topics_group)
         
+        # --- 滤波设置 ---
         filter_group = QGroupBox("🔧 滤波设置")
         filter_layout = QFormLayout(filter_group)
         self.combo_filter_type = QComboBox()
@@ -240,8 +230,9 @@ class MainWindow(QMainWindow):
         filter_layout.addRow(btn_apply_filter)
         process_layout.addWidget(filter_group)
         
-        action_group = QGroupBox("⚡ 快速操作")
-        action_layout = QVBoxLayout(action_group)
+        # --- 绘图功能 ---
+        plot_group = QGroupBox("📊 绘图功能")
+        plot_layout = QVBoxLayout(plot_group)
         
         btn_plot_position = QPushButton("📈 绘制位置曲线")
         btn_plot_position.clicked.connect(self.plot_position_data)
@@ -260,20 +251,27 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background-color: #c0392b; }
         """)
         btn_clear_curves.clicked.connect(self.clear_all_curves)
+        
+        plot_layout.addWidget(btn_plot_position)
+        plot_layout.addWidget(btn_plot_orientation)
+        plot_layout.addWidget(btn_plot_trajectory)
+        plot_layout.addWidget(btn_plot_3d)
+        plot_layout.addWidget(btn_plot_dashboard)
+        plot_layout.addWidget(btn_clear_curves)
+        process_layout.addWidget(plot_group)
+        
+        # --- 数据导出 ---
+        export_group = QGroupBox("💾 数据导出")
+        export_layout = QVBoxLayout(export_group)
+        
         btn_export_data = QPushButton("💾 导出数据(CSV)")
         btn_export_data.clicked.connect(self.export_data)
         btn_save_plots = QPushButton("🖼️ 保存所有图表")
         btn_save_plots.clicked.connect(self.save_all_plots)
         
-        action_layout.addWidget(btn_plot_position)
-        action_layout.addWidget(btn_plot_orientation)
-        action_layout.addWidget(btn_plot_trajectory)
-        action_layout.addWidget(btn_plot_3d)
-        action_layout.addWidget(btn_plot_dashboard)
-        action_layout.addWidget(btn_clear_curves)
-        action_layout.addWidget(btn_export_data)
-        action_layout.addWidget(btn_save_plots)
-        process_layout.addWidget(action_group)
+        export_layout.addWidget(btn_export_data)
+        export_layout.addWidget(btn_save_plots)
+        process_layout.addWidget(export_group)
         
         process_layout.addStretch()
         process_scroll.setWidget(process_content)
@@ -305,9 +303,9 @@ class MainWindow(QMainWindow):
         self.plot_tab_layout = QVBoxLayout(self.plot_tab)
         self.lbl_plot_placeholder = QLabel("请先加载数据并选择话题\n然后点击绘图按钮生成图表")
         self.lbl_plot_placeholder.setAlignment(Qt.AlignCenter)
-        self.lbl_plot_placeholder.setStyleSheet("""
-            QLabel { font-size: 14px; color: #666666; padding: 20px; background-color: #f5f5f5; border-radius: 8px; }
-        """)
+        self.lbl_plot_placeholder.setStyleSheet(
+            "QLabel { font-size: 14px; color: #666666; padding: 20px; background-color: #f5f5f5; border-radius: 8px; }"
+        )
         self.plot_tab_layout.addWidget(self.lbl_plot_placeholder)
         self.tab_widget.addTab(self.plot_tab, "📊 图表")
         
@@ -316,9 +314,9 @@ class MainWindow(QMainWindow):
         self.tab_3d_layout = QVBoxLayout(self.tab_3d)
         self.lbl_3d_placeholder = QLabel("点击\"🌐 绘制3D轨迹\"按钮\n生成交互式3D轨迹图\n\n支持：鼠标拖拽旋转、滚轮缩放、右键平移")
         self.lbl_3d_placeholder.setAlignment(Qt.AlignCenter)
-        self.lbl_3d_placeholder.setStyleSheet("""
-            QLabel { font-size: 14px; color: #666666; padding: 20px; background-color: #f5f5f5; border-radius: 8px; }
-        """)
+        self.lbl_3d_placeholder.setStyleSheet(
+            "QLabel { font-size: 14px; color: #666666; padding: 20px; background-color: #f5f5f5; border-radius: 8px; }"
+        )
         self.tab_3d_layout.addWidget(self.lbl_3d_placeholder)
         self.tab_widget.addTab(self.tab_3d, "🌐 3D轨迹")
         
@@ -336,9 +334,9 @@ class MainWindow(QMainWindow):
         self.filter_chart_layout.setContentsMargins(0, 0, 0, 0)
         self.lbl_filter_placeholder = QLabel("应用滤波后，对比图表将在此显示")
         self.lbl_filter_placeholder.setAlignment(Qt.AlignCenter)
-        self.lbl_filter_placeholder.setStyleSheet("""
-            QLabel { font-size: 13px; color: #666666; padding: 15px; background-color: #f5f5f5; border-radius: 8px; }
-        """)
+        self.lbl_filter_placeholder.setStyleSheet(
+            "QLabel { font-size: 13px; color: #666666; padding: 15px; background-color: #f5f5f5; border-radius: 8px; }"
+        )
         self.filter_chart_layout.addWidget(self.lbl_filter_placeholder)
         compare_splitter.addWidget(self.filter_chart_container)
         self.compare_tab_layout.addWidget(compare_splitter)
@@ -352,7 +350,6 @@ class MainWindow(QMainWindow):
     def _setup_console_redirect(self):
         self._console_signaler = ConsoleSignaler()
         self._console_signaler.text_written.connect(self._append_console_text)
-        
         self._stdout_stream = ConsoleStream(self._console_signaler, 'OUT')
         self._stderr_stream = ConsoleStream(self._console_signaler, 'ERR')
         self._original_stdout = sys.stdout
@@ -361,11 +358,6 @@ class MainWindow(QMainWindow):
         sys.stderr = self._stderr_stream
     
     def _append_console_text(self, text: str):
-        """在主线程中安全地追加控制台文本
-        
-        此方法作为信号槽，由ConsoleSignaler.text_written信号触发，
-        确保QTextEdit的GUI操作始终在主线程中执行。
-        """
         self.text_console.moveCursor(QTextCursor.End)
         self.text_console.insertPlainText(text)
         self.text_console.moveCursor(QTextCursor.End)
@@ -401,21 +393,16 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
         
         view_menu = menubar.addMenu("视图(&V)")
-        pos_view_action = QAction("位置-时间曲线", self)
-        pos_view_action.triggered.connect(self.plot_position_data)
-        view_menu.addAction(pos_view_action)
-        ori_view_action = QAction("姿态-时间曲线", self)
-        ori_view_action.triggered.connect(self.plot_orientation_data)
-        view_menu.addAction(ori_view_action)
-        traj_view_action = QAction("2D轨迹图", self)
-        traj_view_action.triggered.connect(self.plot_2d_trajectory)
-        view_menu.addAction(traj_view_action)
-        traj_3d_action = QAction("3D轨迹图", self)
-        traj_3d_action.triggered.connect(self.plot_3d_trajectory)
-        view_menu.addAction(traj_3d_action)
-        dashboard_action = QAction("综合仪表板", self)
-        dashboard_action.triggered.connect(self.plot_dashboard)
-        view_menu.addAction(dashboard_action)
+        for label, slot in [
+            ("位置-时间曲线", self.plot_position_data),
+            ("姿态-时间曲线", self.plot_orientation_data),
+            ("2D轨迹图", self.plot_2d_trajectory),
+            ("3D轨迹图", self.plot_3d_trajectory),
+            ("综合仪表板", self.plot_dashboard),
+        ]:
+            action = QAction(label, self)
+            action.triggered.connect(slot)
+            view_menu.addAction(action)
         view_menu.addSeparator()
         clear_action = QAction("清除所有曲线", self)
         clear_action.triggered.connect(self.clear_all_curves)
@@ -431,6 +418,61 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress_bar)
+    
+    # ==================== Dynamic Topic Buttons ====================
+    
+    def _rebuild_topic_buttons(self):
+        """根据加载的bag文件动态重建话题按钮列表"""
+        # 清除旧按钮
+        for btn in self._topic_buttons:
+            self.topics_btn_layout.removeWidget(btn)
+            btn.deleteLater()
+        self._topic_buttons.clear()
+        
+        if not self.parser:
+            no_file_label = QLabel("请先加载bag文件")
+            no_file_label.setAlignment(Qt.AlignCenter)
+            no_file_label.setStyleSheet("color: #999; font-style: italic;")
+            self.topics_btn_layout.addWidget(no_file_label)
+            return
+        
+        supported_types = BagParser.SUPPORTED_MSG_TYPES
+        
+        for topic_name, info in sorted(self.parser.topics_info.items()):
+            is_supported = info.msg_type in supported_types
+            
+            btn = QPushButton(f"{topic_name}\n  ({info.msg_type})")
+            btn.setToolTip(
+                f"点击提取 {topic_name} 的数据\n消息类型: {info.msg_type}\n消息数量: {info.message_count}"
+            )
+            
+            if is_supported:
+                btn.setStyleSheet("""
+                    QPushButton { text-align: left; padding: 4px 8px; border: 1px solid #ccc; border-radius: 3px; }
+                    QPushButton:hover { background-color: #e3f2fd; border-color: #2196F3; }
+                """)
+                btn.clicked.connect(lambda checked, t=topic_name: self.select_target_topic(t))
+            else:
+                btn.setStyleSheet("""
+                    QPushButton { text-align: left; padding: 4px 8px; border: 1px solid #ddd; 
+                                  border-radius: 3px; color: #999; background-color: #fafafa; }
+                    QPushButton:hover { background-color: #fff3e0; border-color: #ff9800; }
+                """)
+                btn.clicked.connect(lambda checked, t=topic_name, mt=info.msg_type: self._on_unsupported_topic(t, mt))
+            
+            self.topics_btn_layout.addWidget(btn)
+            self._topic_buttons.append(btn)
+    
+    def _on_unsupported_topic(self, topic_name: str, msg_type: str):
+        """点击不支持的话题时弹窗提示"""
+        supported = "\n".join(f"  • {t}" for t in BagParser.SUPPORTED_MSG_TYPES)
+        QMessageBox.warning(
+            self, "不支持的消息类型",
+            f"话题 '{topic_name}' 的消息类型为 '{msg_type}'，\n"
+            f"当前不支持从该类型提取数据。\n\n"
+            f"当前支持的消息类型：\n{supported}",
+            QMessageBox.Ok
+        )
     
     # ==================== Data Clearing ====================
     
@@ -536,12 +578,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"加载完成 - 发现 {len(parser.topics_info)} 个话题（旧数据已清除）"
         )
+        
+        # 更新话题列表
         self.list_topics.clear()
         for topic_name, info in sorted(parser.topics_info.items()):
             item_text = f"{info.name}\n  ({info.msg_type}, {info.message_count}条)"
             self.list_topics.addItem(item_text)
             item = self.list_topics.item(self.list_topics.count() - 1)
             item.setData(Qt.UserRole, topic_name)
+        
+        # 动态重建话题按钮
+        self._rebuild_topic_buttons()
+        
         report = parser.get_statistics_report()
         self.text_info.setText(report)
         self.tab_widget.setCurrentIndex(0)
@@ -590,24 +638,45 @@ class MainWindow(QMainWindow):
                 if topic_name in self.filtered_pose_data:
                     del self.filtered_pose_data[topic_name]
                 
-                info_text = (
-                    f"话题: {topic_name}\n"
-                    f"{'='*40}\n\n"
-                    f"数据点数: {len(pose_data.timestamp)}\n"
-                    f"时间范围: {pose_data.timestamp[0]:.2f}s - {pose_data.timestamp[-1]:.2f}s\n"
-                    f"持续时间: {(pose_data.timestamp[-1]-pose_data.timestamp[0]):.2f}s\n\n"
-                    f"位置范围:\n"
-                    f"  X: [{pose_data.x.min():.4f}, {pose_data.x.max():.4f}] m\n"
-                    f"  Y: [{pose_data.y.min():.4f}, {pose_data.y.max():.4f}] m\n"
-                    f"  Z: [{pose_data.z.min():.4f}, {pose_data.z.max():.4f}] m\n\n"
-                    f"姿态范围:\n"
-                    f"  Roll:  [{np.degrees(pose_data.roll).min():.2f}°, {np.degrees(pose_data.roll).max():.2f}°]\n"
-                    f"  Pitch: [{np.degrees(pose_data.pitch).min():.2f}°, {np.degrees(pose_data.pitch).max():.2f}°]\n"
-                    f"  Yaw:   [{np.degrees(pose_data.yaw).min():.2f}°, {np.degrees(pose_data.yaw).max():.2f}°]"
-                )
+                msg_type = self.parser.topics_info[topic_name].msg_type
+                is_twist = 'Twist' in msg_type
+                
+                if is_twist:
+                    info_text = (
+                        f"话题: {topic_name}\n"
+                        f"{'='*40}\n\n"
+                        f"消息类型: {msg_type} (速度数据)\n"
+                        f"数据点数: {len(pose_data.timestamp)}\n"
+                        f"时间范围: {pose_data.timestamp[0]:.2f}s - {pose_data.timestamp[-1]:.2f}s\n"
+                        f"持续时间: {(pose_data.timestamp[-1]-pose_data.timestamp[0]):.2f}s\n\n"
+                        f"线速度范围:\n"
+                        f"  Vx: [{pose_data.x.min():.4f}, {pose_data.x.max():.4f}] m/s\n"
+                        f"  Vy: [{pose_data.y.min():.4f}, {pose_data.y.max():.4f}] m/s\n"
+                        f"  Vz: [{pose_data.z.min():.4f}, {pose_data.z.max():.4f}] m/s\n\n"
+                        f"角速度范围:\n"
+                        f"  Wx: [{pose_data.roll.min():.4f}, {pose_data.roll.max():.4f}] rad/s\n"
+                        f"  Wy: [{pose_data.pitch.min():.4f}, {pose_data.pitch.max():.4f}] rad/s\n"
+                        f"  Wz: [{pose_data.yaw.min():.4f}, {pose_data.yaw.max():.4f}] rad/s"
+                    )
+                else:
+                    info_text = (
+                        f"话题: {topic_name}\n"
+                        f"{'='*40}\n\n"
+                        f"数据点数: {len(pose_data.timestamp)}\n"
+                        f"时间范围: {pose_data.timestamp[0]:.2f}s - {pose_data.timestamp[-1]:.2f}s\n"
+                        f"持续时间: {(pose_data.timestamp[-1]-pose_data.timestamp[0]):.2f}s\n\n"
+                        f"位置范围:\n"
+                        f"  X: [{pose_data.x.min():.4f}, {pose_data.x.max():.4f}] m\n"
+                        f"  Y: [{pose_data.y.min():.4f}, {pose_data.y.max():.4f}] m\n"
+                        f"  Z: [{pose_data.z.min():.4f}, {pose_data.z.max():.4f}] m\n\n"
+                        f"姿态范围:\n"
+                        f"  Roll:  [{np.degrees(pose_data.roll).min():.2f}°, {np.degrees(pose_data.roll).max():.2f}°]\n"
+                        f"  Pitch: [{np.degrees(pose_data.pitch).min():.2f}°, {np.degrees(pose_data.pitch).max():.2f}°]\n"
+                        f"  Yaw:   [{np.degrees(pose_data.yaw).min():.2f}°, {np.degrees(pose_data.yaw).max():.2f}°]"
+                    )
                 self.text_info.setText(info_text)
                 self.statusBar().showMessage(
-                    f"已提取 '{topic_name}' 的位姿数据 ({len(pose_data.timestamp)} 个点)"
+                    f"已提取 '{topic_name}' 的数据 ({len(pose_data.timestamp)} 个点)"
                 )
                 
                 for i in range(self.list_topics.count()):
@@ -619,14 +688,14 @@ class MainWindow(QMainWindow):
                 
                 QMessageBox.information(
                     self, "数据提取成功",
-                    f"成功从话题 '{topic_name}' 提取了 {len(pose_data.timestamp)} 个数据点的位姿信息。",
+                    f"成功从话题 '{topic_name}' 提取了 {len(pose_data.timestamp)} 个数据点。",
                     QMessageBox.Ok
                 )
             else:
                 QMessageBox.warning(
                     self, "提取失败",
-                    f"无法从话题 '{topic_name}' 提取有效的位姿数据。\n\n"
-                    "可能原因:\n- 该话题不包含位姿信息\n- 消息格式不支持\n- 数据为空",
+                    f"无法从话题 '{topic_name}' 提取有效的数据。\n\n"
+                    "可能原因:\n- 该话题不包含位姿/速度信息\n- 消息格式不支持\n- 数据为空",
                     QMessageBox.Ok
                 )
         except Exception as e:
@@ -833,7 +902,6 @@ class MainWindow(QMainWindow):
         fig.savefig(temp_path, dpi=150, bbox_inches='tight')
     
     def _display_3d_figure(self):
-        """在3D轨迹选项卡中生成并显示交互式3D轨迹图"""
         from mpl_toolkits.mplot3d import Axes3D
         
         if self.canvas_3d is not None:
@@ -927,11 +995,12 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "关于",
             "<h2>ROS Bag数据分析与可视化系统</h2>"
-            "<p>版本: 2.0.0</p>"
+            "<p>版本: 2.1.0</p>"
             "<p>功能:</p>"
             "<ul>"
             "<li>.bag文件解析与话题提取</li>"
-            "<li>位姿数据可视化（位置、姿态、2D/3D轨迹）</li>"
+            "<li>位姿/速度数据可视化（位置、姿态、2D/3D轨迹）</li>"
+            "<li>支持Odometry/PoseStamped/Path/Twist/Imu等消息</li>"
             "<li>多种滤波算法支持</li>"
             "<li>3D交互式轨迹展示</li>"
             "<li>数据导出与报表生成</li>"
@@ -948,7 +1017,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName("ROS Bag Analyzer")
-    app.setApplicationVersion("2.0.0")
+    app.setApplicationVersion("2.1.0")
     
     window = MainWindow()
     window.show()

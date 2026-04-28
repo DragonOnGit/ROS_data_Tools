@@ -9,16 +9,27 @@
 ✅ **数据提取模块**
 - 完整解析`.bag`文件，自动识别所有ROS话题
 - 提取话题基本信息（名称、类型、消息数量、时间戳范围）
-- 支持位姿数据(pose和orientation)的精确提取
+- 支持多种消息类型的数据提取：
+  - `nav_msgs/Odometry` - 里程计位姿数据
+  - `geometry_msgs/PoseStamped` - 位姿消息
+  - `geometry_msgs/PoseWithCovarianceStamped` - 带协方差的位姿
+  - `nav_msgs/Path` - 路径消息（提取最新位置点）
+  - `geometry_msgs/Twist` - 线速度/角速度数据
+  - `geometry_msgs/TwistStamped` - 带时间戳的速度数据
+  - `geometry_msgs/Vector3Stamped` - 三维向量数据
+  - `sensor_msgs/Imu` - IMU数据
+- 不支持的话题类型点击时弹窗提示
 - 数据导出为CSV格式
 
 ✅ **数据可视化模块**
 - 位置数据(x, y, z)随时间变化的曲线图
 - 姿态数据(roll, pitch, yaw)随时间变化的曲线图
-- 2D/3D运动轨迹可视化
+- 2D/3D运动轨迹可视化（3D支持交互旋转/缩放/平移）
 - 多话题数据对比显示
 - 综合仪表板视图
+- 图表内嵌预览与导航工具栏
 - 图表包含完整的标题、标签、图例和网格线
+- 中文字体自动适配（Windows/Linux/macOS）
 
 ✅ **数据修改与滤波模块**
 - 7种专业滤波算法：

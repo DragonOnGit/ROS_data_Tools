@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QSplitter, QProgressBar, QStatusBar,
                              QAction, QMenu, QMenuBar, QDialog, QLineEdit,
                              QScrollArea)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QFont, QTextCursor
 
 from bag_parser import BagParser, TopicInfo, PoseData
@@ -36,20 +36,33 @@ plt.rcParams['font.sans-serif'] = _font_candidates
 plt.rcParams['axes.unicode_minus'] = False
 
 
-class ConsoleStream(io.TextIOBase):
-    """重定向stdout/stderr到QTextEdit的流对象"""
+class ConsoleSignaler(QObject):
+    """用于跨线程安全传递控制台文本的信号对象
     
-    def __init__(self, text_edit: QTextEdit, tag: str = ''):
+    Qt的GUI操作必须在主线程执行。当后台线程（如BagLoadingThread）
+    通过print()输出日志时，不能直接操作QTextEdit，需要通过信号
+    将文本传递到主线程进行安全更新。
+    """
+    text_written = pyqtSignal(str)
+
+
+class ConsoleStream(io.TextIOBase):
+    """重定向stdout/stderr到QTextEdit的流对象
+    
+    通过信号机制实现线程安全的控制台输出重定向。
+    工作线程调用write()时，文本通过信号传递到主线程，
+    由主线程的槽函数负责更新QTextEdit。
+    """
+    
+    def __init__(self, signaler: ConsoleSignaler, tag: str = ''):
         super().__init__()
-        self.text_edit = text_edit
+        self.signaler = signaler
         self.tag = tag
         self._original = None
     
     def write(self, text: str):
         if text and text.strip():
-            self.text_edit.moveCursor(QTextCursor.End)
-            self.text_edit.insertPlainText(text)
-            self.text_edit.moveCursor(QTextCursor.End)
+            self.signaler.text_written.emit(text)
         return len(text) if text else 0
     
     def flush(self):
@@ -337,12 +350,25 @@ class MainWindow(QMainWindow):
     # ==================== Console Redirect ====================
     
     def _setup_console_redirect(self):
-        self._stdout_stream = ConsoleStream(self.text_console, 'OUT')
-        self._stderr_stream = ConsoleStream(self.text_console, 'ERR')
+        self._console_signaler = ConsoleSignaler()
+        self._console_signaler.text_written.connect(self._append_console_text)
+        
+        self._stdout_stream = ConsoleStream(self._console_signaler, 'OUT')
+        self._stderr_stream = ConsoleStream(self._console_signaler, 'ERR')
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
         sys.stdout = self._stdout_stream
         sys.stderr = self._stderr_stream
+    
+    def _append_console_text(self, text: str):
+        """在主线程中安全地追加控制台文本
+        
+        此方法作为信号槽，由ConsoleSignaler.text_written信号触发，
+        确保QTextEdit的GUI操作始终在主线程中执行。
+        """
+        self.text_console.moveCursor(QTextCursor.End)
+        self.text_console.insertPlainText(text)
+        self.text_console.moveCursor(QTextCursor.End)
     
     def closeEvent(self, event):
         sys.stdout = self._original_stdout

@@ -403,8 +403,6 @@ class BagParser:
             
             for idx, (timestamp, msg) in enumerate(messages):
                 try:
-                    timestamps.append(timestamp)
-                    
                     # 对于rosbags后端，需要先反序列化消息
                     if self.backend == 'rosbags':
                         msg = self._deserialize_rosbags_message(msg, topic_name)
@@ -412,21 +410,40 @@ class BagParser:
                             error_count += 1
                             continue
                     
-                    # 从消息对象中提取位姿数据
-                    pose = self._extract_pose_from_message(msg)
+                    # 检查是否为Path类型消息（需要展开所有路径点）
+                    is_path_type = hasattr(msg, 'poses') and len(msg.poses) > 0 and not hasattr(msg, 'pose')
                     
-                    if pose is not None:
-                        pos, quat = pose
-                        positions_x.append(pos[0])
-                        positions_y.append(pos[1])
-                        positions_z.append(pos[2])
-                        quaternions_w.append(quat[0])
-                        quaternions_x.append(quat[1])
-                        quaternions_y.append(quat[2])
-                        quaternions_z.append(quat[3])
-                        success_count += 1
+                    if is_path_type:
+                        path_poses = self._extract_poses_from_path_message(msg, timestamp)
+                        if path_poses:
+                            for ts, pos, quat in path_poses:
+                                timestamps.append(ts)
+                                positions_x.append(pos[0])
+                                positions_y.append(pos[1])
+                                positions_z.append(pos[2])
+                                quaternions_w.append(quat[0])
+                                quaternions_x.append(quat[1])
+                                quaternions_y.append(quat[2])
+                                quaternions_z.append(quat[3])
+                                success_count += 1
+                        else:
+                            error_count += 1
                     else:
-                        error_count += 1
+                        timestamps.append(timestamp)
+                        pose = self._extract_pose_from_message(msg)
+                        
+                        if pose is not None:
+                            pos, quat = pose
+                            positions_x.append(pos[0])
+                            positions_y.append(pos[1])
+                            positions_z.append(pos[2])
+                            quaternions_w.append(quat[0])
+                            quaternions_x.append(quat[1])
+                            quaternions_y.append(quat[2])
+                            quaternions_z.append(quat[3])
+                            success_count += 1
+                        else:
+                            error_count += 1
                         
                 except Exception as e:
                     error_count += 1
@@ -514,7 +531,7 @@ class BagParser:
         支持多种常见的包含位姿信息的消息类型：
         - nav_msgs/Odometry: 标准里程计消息
         - geometry_msgs/PoseStamped: 带时间戳的位姿消息
-        - nav_msgs/Path: 路径消息（提取第一个点）
+        - nav_msgs/Path: 路径消息（提取最后一个路径点，代表当前位置）
         
         Args:
             msg: ROS消息对象
@@ -523,43 +540,76 @@ class BagParser:
             Optional[Tuple]: 包含(位置元组, 四元数元组)的元组，或None
         """
         try:
-            # 尝试不同的消息类型结构
             if hasattr(msg, 'pose') and hasattr(msg.pose, 'pose'):
-                # nav_msgs/Odometry 类型
                 pose = msg.pose.pose
                 position = (pose.position.x, pose.position.y, pose.position.z)
                 quaternion = (pose.orientation.w, pose.orientation.x,
                              pose.orientation.y, pose.orientation.z)
                 return (position, quaternion)
                 
+            elif hasattr(msg, 'poses') and len(msg.poses) > 0:
+                last_pose = msg.poses[-1].pose
+                position = (last_pose.position.x, last_pose.position.y, last_pose.position.z)
+                quaternion = (last_pose.orientation.w, last_pose.orientation.x,
+                             last_pose.orientation.y, last_pose.orientation.z)
+                return (position, quaternion)
+                
             elif hasattr(msg, 'pose'):
-                # geometry_msgs/PoseStamped 类型
                 pose = msg.pose
                 position = (pose.position.x, pose.position.y, pose.position.z)
                 quaternion = (pose.orientation.w, pose.orientation.x,
                              pose.orientation.y, pose.orientation.z)
                 return (position, quaternion)
                 
-            elif hasattr(msg, 'poses') and len(msg.poses) > 0:
-                # nav_msgs/Path 类型 - 返回第一个路径点
-                first_pose = msg.poses[0].pose
-                position = (first_pose.position.x, first_pose.position.y, first_pose.position.z)
-                quaternion = (first_pose.orientation.w, first_pose.orientation.x,
-                             first_pose.orientation.y, first_pose.orientation.z)
+            elif hasattr(msg, 'position') and hasattr(msg, 'orientation'):
+                position = (msg.position.x, msg.position.y, msg.position.z)
+                quaternion = (msg.orientation.w, msg.orientation.x,
+                             msg.orientation.y, msg.orientation.z)
                 return (position, quaternion)
-                
             else:
-                # 尝试其他可能的字段名组合
-                if hasattr(msg, 'position') and hasattr(msg, 'orientation'):
-                    position = (msg.position.x, msg.position.y, msg.position.z)
-                    quaternion = (msg.orientation.w, msg.orientation.x,
-                                 msg.orientation.y, msg.orientation.z)
-                    return (position, quaternion)
-                else:
-                    return None
+                return None
                 
         except Exception:
             return None
+
+    def _extract_poses_from_path_message(self, msg: Any, base_timestamp: float) -> List[Tuple[float, Tuple[float, ...], Tuple[float, ...]]]:
+        """从nav_msgs/Path消息中提取所有路径点的位姿数据
+        
+        每个Path消息包含多个PoseStamped路径点，需要展开为独立的数据点。
+        
+        Args:
+            msg: ROS Path消息对象
+            base_timestamp: 消息的基础时间戳
+            
+        Returns:
+            List[Tuple]: 每个元素为(timestamp, position_tuple, quaternion_tuple)
+        """
+        results = []
+        try:
+            if not hasattr(msg, 'poses') or len(msg.poses) == 0:
+                return results
+            
+            n_poses = len(msg.poses)
+            for i, pose_stamped in enumerate(msg.poses):
+                pose = pose_stamped.pose
+                
+                if hasattr(pose_stamped, 'header') and hasattr(pose_stamped.header, 'stamp'):
+                    try:
+                        ts = pose_stamped.header.stamp.to_sec()
+                    except Exception:
+                        ts = base_timestamp + i * 0.01
+                else:
+                    ts = base_timestamp + i * (1.0 / max(n_poses, 1))
+                
+                position = (pose.position.x, pose.position.y, pose.position.z)
+                quaternion = (pose.orientation.w, pose.orientation.x,
+                             pose.orientation.y, pose.orientation.z)
+                results.append((ts, position, quaternion))
+                
+        except Exception:
+            pass
+        
+        return results
 
     @staticmethod
     def _quaternion_to_euler(w: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

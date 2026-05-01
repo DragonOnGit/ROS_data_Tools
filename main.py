@@ -2,7 +2,7 @@
 """
 ROS Bag文件数据处理与可视化系统 - 主程序
 功能：提供图形用户界面，整合所有功能模块
-版本：3.0.0 - UI重构 + 占据网格图
+版本：3.1.0 - 占据网格图修复 + 多视图 + 位置标识
 """
 
 import sys
@@ -100,7 +100,9 @@ class MainWindow(QMainWindow):
         self.filtered_pose_data = {}
         self.octree_map = None
         self.octree_visualizer = None
-        self.occupancy_grid = None
+        self.global_ogm = None
+        self.local_ogm = None
+        self._drone_altitude = None
 
         self.plot_canvas = None
         self._plot_toolbar = None
@@ -354,6 +356,9 @@ class MainWindow(QMainWindow):
         self.lbl_gt_pos = QLabel("未获取")
         self.lbl_gt_pos.setStyleSheet("color: #666;")
         gl.addRow("无人机位置:", self.lbl_gt_pos)
+        self.lbl_gt_alt = QLabel("未获取")
+        self.lbl_gt_alt.setStyleSheet("color: #1565C0; font-weight: bold;")
+        gl.addRow("飞行高度(m):", self.lbl_gt_alt)
         btn_local = QPushButton("📍 生成局部占据网格图")
         btn_local.setMinimumHeight(32)
         btn_local.setStyleSheet(
@@ -599,10 +604,13 @@ class MainWindow(QMainWindow):
     def clear_mapping_data(self):
         self.octree_map = None
         self.octree_visualizer = None
-        self.occupancy_grid = None
+        self.global_ogm = None
+        self.local_ogm = None
+        self._drone_altitude = None
         self._clear_canvas(self.tab_oct_lay, 'canvas_octree', '_toolbar_octree', self.lbl_oct_ph)
         self._clear_canvas(self.tab_ogm_lay, 'canvas_ogm', '_toolbar_ogm', self.lbl_ogm_ph)
         self.lbl_gt_pos.setText("未获取")
+        self.lbl_gt_alt.setText("未获取")
         if hasattr(self, '_pc2_points'):
             del self._pc2_points
         if hasattr(self, '_pc2_topic'):
@@ -627,7 +635,8 @@ class MainWindow(QMainWindow):
         self._clear_canvas(self.tab_ogm_lay, 'canvas_ogm', '_toolbar_ogm', self.lbl_ogm_ph)
         self.text_filter.clear()
         self.text_info.clear()
-        self.octree_map = None; self.octree_visualizer = None; self.occupancy_grid = None
+        self.octree_map = None; self.octree_visualizer = None
+        self.global_ogm = None; self.local_ogm = None; self._drone_altitude = None
         self.lbl_file.setText(f"正在加载:\n{path}")
         self.progress_bar.setVisible(True); self.progress_bar.setRange(0, 0)
         self._thread = BagLoadingThread(path)
@@ -890,12 +899,16 @@ class MainWindow(QMainWindow):
         if gt_topic in self.current_pose_data:
             pd = self.current_pose_data[gt_topic]
             if len(pd.x) > 0:
+                self._drone_altitude = pd.z[-1]
+                self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
                 return np.array([pd.x[-1], pd.y[-1]])
         if self.parser and gt_topic in self.parser.get_topic_names():
             try:
                 pd = self.parser.extract_pose_data(gt_topic)
                 if pd and len(pd.x) > 0:
                     self.current_pose_data[gt_topic] = pd
+                    self._drone_altitude = pd.z[-1]
+                    self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
                     return np.array([pd.x[-1], pd.y[-1]])
             except Exception: pass
         return None
@@ -905,10 +918,17 @@ class MainWindow(QMainWindow):
         if pts is None or len(pts) == 0:
             QMessageBox.warning(self, "无数据", "请先提取点云数据！", QMessageBox.Ok); return
         config = self._get_ogm_config()
+        sensor_pos = None
+        center = self._get_gt_position()
+        if center is not None:
+            sensor_pos = center.reshape(1, -1)
         try:
-            self.occupancy_grid = OccupancyGridMap(config)
-            self.occupancy_grid.build(pts)
-            self._show_ogm("全局占据网格图")
+            self.global_ogm = OccupancyGridMap(config)
+            self.global_ogm.build(pts, sensor_positions=sensor_pos)
+            if self.local_ogm is not None and self.local_ogm.grid is not None:
+                self._show_ogm_dual()
+            else:
+                self._show_ogm_single(self.global_ogm, "全局占据网格图", center=center)
         except Exception as e:
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
@@ -925,31 +945,62 @@ class MainWindow(QMainWindow):
         self.lbl_gt_pos.setText(f"({center[0]:.2f}, {center[1]:.2f})")
         config = self._get_ogm_config()
         try:
-            self.occupancy_grid = OccupancyGridMap(config)
-            self.occupancy_grid.build_local(pts, center)
-            self._show_ogm(f"局部占据网格图 (中心: {center[0]:.1f}, {center[1]:.1f})")
+            self.local_ogm = OccupancyGridMap(config)
+            self.local_ogm.build_local(pts, center, sensor_position=center)
+            if self.global_ogm is not None and self.global_ogm.grid is not None:
+                self._show_ogm_dual()
+            else:
+                self._show_ogm_single(self.local_ogm,
+                    f"局部占据网格图 (中心: {center[0]:.1f}, {center[1]:.1f})",
+                    center=center)
         except Exception as e:
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
 
-    def _show_ogm(self, title):
-        if self.occupancy_grid is None or self.occupancy_grid.grid is None:
+    def _show_ogm_single(self, ogm, title, center=None):
+        if ogm is None or ogm.grid is None:
             return
         self._clear_canvas(self.tab_ogm_lay, 'canvas_ogm', '_toolbar_ogm', self.lbl_ogm_ph)
         self.lbl_ogm_ph.hide()
-        fig = self.occupancy_grid.visualize(title=title)
+        local_bounds = None
+        if ogm is self.global_ogm and self.local_ogm is not None:
+            local_bounds = self.local_ogm.local_bounds
+        fig = ogm.visualize(title=title, local_bounds=local_bounds, center=center)
         cv = FigureCanvas(fig); cv.setMinimumHeight(400)
         tb = NavigationToolbar(cv, self); tb.setMaximumHeight(35)
         self.tab_ogm_lay.insertWidget(0, tb); self.tab_ogm_lay.insertWidget(1, cv)
         self.canvas_ogm = cv; self._toolbar_ogm = tb
         self.tab_widget.setCurrentIndex(4)
-        stats = self.occupancy_grid.get_statistics()
+        stats = ogm.get_statistics()
         self.statusBar().showMessage(
-            f"占据网格图已生成 | 占据率: {stats.get('occupancy_rate',0):.1f}%")
+            f"占据网格图已生成 | 占据: {stats.get('occupancy_rate',0):.1f}% | 空闲: {stats.get('free_rate',0):.1f}%")
         QMessageBox.information(self, "生成完成",
             f"网格: {stats.get('grid_width',0)}x{stats.get('grid_height',0)}\n"
             f"占据率: {stats.get('occupancy_rate',0):.1f}%\n"
+            f"空闲率: {stats.get('free_rate',0):.1f}%\n"
             f"耗时: {stats.get('build_time',0):.3f}s", QMessageBox.Ok)
+
+    def _show_ogm_dual(self):
+        if self.global_ogm is None or self.local_ogm is None:
+            return
+        if self.global_ogm.grid is None or self.local_ogm.grid is None:
+            return
+        self._clear_canvas(self.tab_ogm_lay, 'canvas_ogm', '_toolbar_ogm', self.lbl_ogm_ph)
+        self.lbl_ogm_ph.hide()
+        fig = self.local_ogm.visualize_dual(self.global_ogm)
+        cv = FigureCanvas(fig); cv.setMinimumHeight(400)
+        tb = NavigationToolbar(cv, self); tb.setMaximumHeight(35)
+        self.tab_ogm_lay.insertWidget(0, tb); self.tab_ogm_lay.insertWidget(1, cv)
+        self.canvas_ogm = cv; self._toolbar_ogm = tb
+        self.tab_widget.setCurrentIndex(4)
+        g_stats = self.global_ogm.get_statistics()
+        l_stats = self.local_ogm.get_statistics()
+        self.statusBar().showMessage(
+            f"全局+局部占据网格图 | 全局占据: {g_stats.get('occupancy_rate',0):.1f}% | 局部占据: {l_stats.get('occupancy_rate',0):.1f}%")
+        QMessageBox.information(self, "生成完成",
+            f"全局: {g_stats.get('grid_width',0)}x{g_stats.get('grid_height',0)} 占据:{g_stats.get('occupancy_rate',0):.1f}%\n"
+            f"局部: {l_stats.get('grid_width',0)}x{l_stats.get('grid_height',0)} 占据:{l_stats.get('occupancy_rate',0):.1f}%",
+            QMessageBox.Ok)
 
     # ==================== Export ====================
 
@@ -971,7 +1022,7 @@ class MainWindow(QMainWindow):
     def show_about(self):
         QMessageBox.about(self, "关于",
             "<h2>ROS Bag数据分析与可视化系统</h2>"
-            "<p>版本: 3.0.0</p>"
+            "<p>版本: 3.1.0</p>"
             "<ul>"
             "<li>位姿数据可视化（位置/姿态/2D/3D轨迹）</li>"
             "<li>八叉树地图生成与可视化</li>"
@@ -988,7 +1039,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName("ROS Bag Analyzer")
-    app.setApplicationVersion("3.0.0")
+    app.setApplicationVersion("3.1.0")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

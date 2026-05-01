@@ -1,0 +1,48 @@
+# ROS Bag文件数据处理项目 - .gitignore文件
+
+# Python字节码文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 导出数据目录（包含用户数据，不应纳入版本控制）
+exported_data/
+
+# 生成的图表和临时文件
+plots/
+temp_plots/
+
+# 压缩包和大型文件
+*.zip
+*.tar.gz
+*.bag  # ROS bag文件通常较大，不应纳入版本控制
+
+# 日志文件
+*.log
+
+# 虚拟环境目录
+venv/
+env/
+
+# IDE和编辑器配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 测试和临时文件
+deep_diagnose.py
+
+# 环境变量文件
+.env
+*.env
+
+# 构建产物
+build/
+dist/
+*.egg-info/

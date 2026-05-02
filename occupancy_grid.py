@@ -25,6 +25,108 @@ from typing import Optional, Dict, Tuple, List
 import time
 
 
+class CoordinateTransformer:
+    """坐标系转换器
+    
+    处理无人机坐标系与地图坐标系之间的转换。
+    当两个坐标系的x轴和y轴方向完全相反时，
+    需要将无人机位置取反后映射到地图坐标系。
+    
+    转换公式：
+        map_x = -drone_x
+        map_y = -drone_y
+    
+    使用示例：
+        transformer = CoordinateTransformer(flip_x=True, flip_y=True)
+        map_pos = transformer.transform_point(drone_pos)
+        map_traj = transformer.transform_trajectory(drone_xy)
+    """
+    
+    def __init__(self, flip_x: bool = True, flip_y: bool = True,
+                 offset_x: float = 0.0, offset_y: float = 0.0):
+        """
+        Args:
+            flip_x: 是否翻转x轴
+            flip_y: 是否翻转y轴
+            offset_x: x轴偏移量（翻转后叠加）
+            offset_y: y轴偏移量（翻转后叠加）
+        """
+        self.flip_x = flip_x
+        self.flip_y = flip_y
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+    
+    def transform_point(self, point: np.ndarray) -> np.ndarray:
+        """转换单个点坐标
+        
+        Args:
+            point: 坐标 (x, y) 或 (x, y, z)
+            
+        Returns:
+            转换后的坐标
+        """
+        result = point.copy()
+        if self.flip_x:
+            result[0] = -result[0] + self.offset_x
+        else:
+            result[0] = result[0] + self.offset_x
+        if self.flip_y:
+            result[1] = -result[1] + self.offset_y
+        else:
+            result[1] = result[1] + self.offset_y
+        return result
+    
+    def transform_trajectory(self, xy: np.ndarray) -> np.ndarray:
+        """转换轨迹坐标数组
+        
+        Args:
+            xy: 坐标数组，形状为(N, 2)或(N, 3)
+            
+        Returns:
+            转换后的坐标数组
+        """
+        result = xy.copy()
+        if self.flip_x:
+            result[:, 0] = -result[:, 0] + self.offset_x
+        else:
+            result[:, 0] = result[:, 0] + self.offset_x
+        if self.flip_y:
+            result[:, 1] = -result[:, 1] + self.offset_y
+        else:
+            result[:, 1] = result[:, 1] + self.offset_y
+        return result
+
+
+@dataclass
+class TrajectoryOverlay:
+    """轨迹叠加配置
+    
+    Attributes:
+        actual_xy: 实际飞行轨迹坐标 (N, 2)
+        expected_xy: 期望轨迹坐标 (M, 2)
+        show_actual: 是否显示实际轨迹
+        show_expected: 是否显示期望轨迹
+        show_all: 全局轨迹显示总开关
+        actual_color: 实际轨迹颜色
+        expected_color: 期望轨迹颜色
+        actual_linewidth: 实际轨迹线宽
+        expected_linewidth: 期望轨迹线宽
+        arrow_interval: 方向箭头间隔（米）
+        arrow_length: 方向箭头长度（米）
+    """
+    actual_xy: Optional[np.ndarray] = None
+    expected_xy: Optional[np.ndarray] = None
+    show_actual: bool = True
+    show_expected: bool = True
+    show_all: bool = True
+    actual_color: tuple = (0, 0, 1.0)
+    expected_color: tuple = (1.0, 0, 0)
+    actual_linewidth: float = 2.0
+    expected_linewidth: float = 2.0
+    arrow_interval: float = 5.0
+    arrow_length: float = 6.0
+
+
 @dataclass
 class OccupancyGridConfig:
     """占据网格图配置参数
@@ -410,7 +512,9 @@ class OccupancyGridMap:
     
     def visualize(self, fig=None, title: str = '占据网格图',
                   local_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-                  center: Optional[np.ndarray] = None) -> 'Figure':
+                  center: Optional[np.ndarray] = None,
+                  trajectory_overlay: Optional['TrajectoryOverlay'] = None,
+                  is_local: bool = False) -> 'Figure':
         """可视化占据网格图
         
         Args:
@@ -418,13 +522,15 @@ class OccupancyGridMap:
             title: 图表标题
             local_bounds: 局部区域边界 (min_xy, max_xy)，用于在全局图上标识
             center: 中心点坐标，用于标识无人机位置
+            trajectory_overlay: 轨迹叠加配置
+            is_local: 是否为局部图（影响箭头绘制）
             
         Returns:
             Figure: matplotlib Figure对象
         """
         from matplotlib.figure import Figure
         from matplotlib.colors import ListedColormap
-        from matplotlib.patches import Rectangle
+        from matplotlib.patches import Rectangle, FancyArrowPatch
         
         if self.grid is None:
             print("[WARN] 无网格数据可可视化")
@@ -482,7 +588,14 @@ class OccupancyGridMap:
             ax.plot(center[0], center[1], 'r^', markersize=12,
                    markeredgecolor='darkred', markeredgewidth=1.5, zorder=15,
                    label='无人机位置')
-            ax.legend(loc='upper right', fontsize=9)
+        
+        if trajectory_overlay is not None and trajectory_overlay.show_all:
+            self._draw_trajectories(ax, trajectory_overlay, extent, is_local)
+        
+        if center is not None or (trajectory_overlay is not None and trajectory_overlay.show_all):
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(loc='upper right', fontsize=9)
         
         ax.set_xlabel('X (m)', fontsize=10)
         ax.set_ylabel('Y (m)', fontsize=10)
@@ -504,8 +617,106 @@ class OccupancyGridMap:
         fig.tight_layout()
         return fig
     
+    def _draw_trajectories(self, ax, overlay: 'TrajectoryOverlay',
+                           extent: list, is_local: bool) -> None:
+        """在坐标轴上绘制轨迹
+        
+        Args:
+            ax: matplotlib坐标轴
+            overlay: 轨迹叠加配置
+            extent: 图像范围 [x_min, x_max, y_min, y_max]
+            is_local: 是否为局部图（局部图添加方向箭头）
+        """
+        x_min, x_max, y_min, y_max = extent
+        
+        if overlay.show_actual and overlay.actual_xy is not None and len(overlay.actual_xy) > 1:
+            ax_pts = overlay.actual_xy
+            mask = (ax_pts[:, 0] >= x_min) & (ax_pts[:, 0] <= x_max) & \
+                   (ax_pts[:, 1] >= y_min) & (ax_pts[:, 1] <= y_max)
+            vis = ax_pts[mask]
+            if len(vis) > 1:
+                ax.plot(vis[:, 0], vis[:, 1], '-',
+                       color=overlay.actual_color,
+                       linewidth=overlay.actual_linewidth,
+                       label='实际轨迹', zorder=20, alpha=0.9)
+        
+        if overlay.show_expected and overlay.expected_xy is not None and len(overlay.expected_xy) > 1:
+            ex_pts = overlay.expected_xy
+            mask = (ex_pts[:, 0] >= x_min) & (ex_pts[:, 0] <= x_max) & \
+                   (ex_pts[:, 1] >= y_min) & (ex_pts[:, 1] <= y_max)
+            vis = ex_pts[mask]
+            if len(vis) > 1:
+                ax.plot(vis[:, 0], vis[:, 1], '--',
+                       color=overlay.expected_color,
+                       linewidth=overlay.expected_linewidth,
+                       label='期望轨迹', zorder=20, alpha=0.9)
+                
+                if is_local:
+                    self._draw_direction_arrows(ax, vis, overlay)
+    
+    def _draw_direction_arrows(self, ax, vis_pts: np.ndarray,
+                               overlay: 'TrajectoryOverlay') -> None:
+        """在期望轨迹上绘制方向指示箭头
+        
+        Args:
+            ax: matplotlib坐标轴
+            vis_pts: 可见的期望轨迹点
+            overlay: 轨迹叠加配置
+        """
+        if len(vis_pts) < 2:
+            return
+        
+        diffs = np.diff(vis_pts, axis=0)
+        seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
+        cum_len = np.concatenate([[0], np.cumsum(seg_lens)])
+        total_len = cum_len[-1]
+        
+        if total_len < overlay.arrow_interval:
+            mid = len(vis_pts) // 2
+            if mid > 0:
+                dx = vis_pts[mid, 0] - vis_pts[mid-1, 0]
+                dy = vis_pts[mid, 1] - vis_pts[mid-1, 1]
+                norm = np.sqrt(dx*dx + dy*dy)
+                if norm > 1e-6:
+                    dx /= norm; dy /= norm
+                    al = overlay.arrow_length
+                    ax.annotate('', xy=(vis_pts[mid, 0] + dx*al/2, vis_pts[mid, 1] + dy*al/2),
+                               xytext=(vis_pts[mid, 0] - dx*al/2, vis_pts[mid, 1] - dy*al/2),
+                               arrowprops=dict(arrowstyle='->', color=overlay.expected_color,
+                                              lw=2, mutation_scale=15),
+                               zorder=25)
+            return
+        
+        n_arrows = max(1, int(total_len / overlay.arrow_interval))
+        for i in range(n_arrows):
+            target_dist = (i + 0.5) * overlay.arrow_interval
+            if target_dist > total_len:
+                break
+            
+            idx = np.searchsorted(cum_len, target_dist) - 1
+            idx = max(0, min(idx, len(vis_pts) - 2))
+            
+            frac = (target_dist - cum_len[idx]) / max(seg_lens[idx], 1e-6)
+            frac = np.clip(frac, 0, 1)
+            
+            px = vis_pts[idx, 0] + frac * diffs[idx, 0]
+            py = vis_pts[idx, 1] + frac * diffs[idx, 1]
+            
+            dx = diffs[idx, 0]
+            dy = diffs[idx, 1]
+            norm = np.sqrt(dx*dx + dy*dy)
+            if norm > 1e-6:
+                dx /= norm; dy /= norm
+                al = overlay.arrow_length
+                ax.annotate('', xy=(px + dx*al/2, py + dy*al/2),
+                           xytext=(px - dx*al/2, py - dy*al/2),
+                           arrowprops=dict(arrowstyle='->', color=overlay.expected_color,
+                                          lw=2, mutation_scale=15),
+                           zorder=25)
+    
     def visualize_dual(self, global_ogm: 'OccupancyGridMap',
-                       title: str = '占据网格图 - 全局/局部对比') -> 'Figure':
+                       title: str = '占据网格图 - 全局/局部对比',
+                       trajectory_overlay: Optional['TrajectoryOverlay'] = None) -> 'Figure':
         """并列可视化全局和局部占据网格图
         
         Args:
@@ -571,6 +782,12 @@ class OccupancyGridMap:
                 ax1.plot(self._local_center[0], self._local_center[1], 'r^',
                         markersize=12, markeredgecolor='darkred', markeredgewidth=1.5,
                         zorder=15, label='无人机位置')
+            
+            if trajectory_overlay is not None and trajectory_overlay.show_all:
+                self._draw_trajectories(ax1, trajectory_overlay, g_extent, is_local=False)
+            
+            handles1, labels1 = ax1.get_legend_handles_labels()
+            if handles1:
                 ax1.legend(loc='upper right', fontsize=9)
             
             g_stats = global_ogm.get_statistics()
@@ -610,6 +827,12 @@ class OccupancyGridMap:
                 ax2.plot(self._local_center[0], self._local_center[1], 'r^',
                         markersize=14, markeredgecolor='darkred', markeredgewidth=2,
                         zorder=15, label='无人机位置')
+            
+            if trajectory_overlay is not None and trajectory_overlay.show_all:
+                self._draw_trajectories(ax2, trajectory_overlay, l_extent, is_local=True)
+            
+            handles2, labels2 = ax2.get_legend_handles_labels()
+            if handles2:
                 ax2.legend(loc='upper right', fontsize=9)
             
             l_stats = self.get_statistics()

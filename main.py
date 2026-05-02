@@ -2,7 +2,7 @@
 """
 ROS Bag文件数据处理与可视化系统 - 主程序
 功能：提供图形用户界面，整合所有功能模块
-版本：3.1.0 - 占据网格图修复 + 多视图 + 位置标识
+版本：3.2.0 - 坐标转换 + 轨迹叠加 + 轨迹控制
 """
 
 import sys
@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QSplitter, QProgressBar, QStatusBar,
                              QAction, QMenu, QMenuBar, QDialog, QLineEdit,
                              QScrollArea, QCheckBox)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
 from PyQt5.QtGui import QIcon, QFont, QTextCursor
 
 from bag_parser import BagParser, TopicInfo, PoseData
@@ -25,7 +25,7 @@ from data_visualizer import DataVisualizer
 from filter_processor import FilterProcessor, FilterConfig
 from octree_map import OctreeMap, OctreeConfig
 from octree_visualizer import OctreeVisualizer
-from occupancy_grid import OccupancyGridMap, OccupancyGridConfig
+from occupancy_grid import OccupancyGridMap, OccupancyGridConfig, CoordinateTransformer, TrajectoryOverlay
 
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -103,6 +103,9 @@ class MainWindow(QMainWindow):
         self.global_ogm = None
         self.local_ogm = None
         self._drone_altitude = None
+        self.coord_transformer = CoordinateTransformer(flip_x=True, flip_y=True)
+        self._actual_traj_xy = None
+        self._expected_traj_xy = None
 
         self.plot_canvas = None
         self._plot_toolbar = None
@@ -368,6 +371,24 @@ class MainWindow(QMainWindow):
         gl.addRow(btn_local)
         lay.addWidget(gg)
 
+        tg_ctrl = QGroupBox("✈️ 轨迹显示控制")
+        tl_ctrl = QVBoxLayout(tg_ctrl)
+        self.chk_traj_all = QCheckBox("全局轨迹显示总开关")
+        self.chk_traj_all.setChecked(True)
+        self.chk_traj_all.setStyleSheet("font-weight: bold;")
+        tl_ctrl.addWidget(self.chk_traj_all)
+        self.chk_traj_actual = QCheckBox("实际飞行轨迹 (蓝色实线)")
+        self.chk_traj_actual.setChecked(True)
+        tl_ctrl.addWidget(self.chk_traj_actual)
+        self.chk_traj_expected = QCheckBox("期望轨迹 (红色虚线)")
+        self.chk_traj_expected.setChecked(True)
+        tl_ctrl.addWidget(self.chk_traj_expected)
+        self.chk_traj_all.toggled.connect(self._on_traj_all_toggled)
+        self.chk_traj_actual.toggled.connect(self._on_traj_toggle_changed)
+        self.chk_traj_expected.toggled.connect(self._on_traj_toggle_changed)
+        self._load_traj_settings()
+        lay.addWidget(tg_ctrl)
+
         btn_map_clr = QPushButton("🗑️ 清除建图数据")
         btn_map_clr.setMinimumHeight(35)
         btn_map_clr.setStyleSheet(
@@ -607,6 +628,8 @@ class MainWindow(QMainWindow):
         self.global_ogm = None
         self.local_ogm = None
         self._drone_altitude = None
+        self._actual_traj_xy = None
+        self._expected_traj_xy = None
         self._clear_canvas(self.tab_oct_lay, 'canvas_octree', '_toolbar_octree', self.lbl_oct_ph)
         self._clear_canvas(self.tab_ogm_lay, 'canvas_ogm', '_toolbar_ogm', self.lbl_ogm_ph)
         self.lbl_gt_pos.setText("未获取")
@@ -637,6 +660,7 @@ class MainWindow(QMainWindow):
         self.text_info.clear()
         self.octree_map = None; self.octree_visualizer = None
         self.global_ogm = None; self.local_ogm = None; self._drone_altitude = None
+        self._actual_traj_xy = None; self._expected_traj_xy = None
         self.lbl_file.setText(f"正在加载:\n{path}")
         self.progress_bar.setVisible(True); self.progress_bar.setRange(0, 0)
         self._thread = BagLoadingThread(path)
@@ -901,7 +925,8 @@ class MainWindow(QMainWindow):
             if len(pd.x) > 0:
                 self._drone_altitude = pd.z[-1]
                 self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
-                return np.array([pd.x[-1], pd.y[-1]])
+                raw = np.array([pd.x[-1], pd.y[-1]])
+                return self.coord_transformer.transform_point(raw)
         if self.parser and gt_topic in self.parser.get_topic_names():
             try:
                 pd = self.parser.extract_pose_data(gt_topic)
@@ -909,9 +934,90 @@ class MainWindow(QMainWindow):
                     self.current_pose_data[gt_topic] = pd
                     self._drone_altitude = pd.z[-1]
                     self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
-                    return np.array([pd.x[-1], pd.y[-1]])
+                    raw = np.array([pd.x[-1], pd.y[-1]])
+                    return self.coord_transformer.transform_point(raw)
             except Exception: pass
         return None
+
+    def _extract_trajectory_data(self):
+        """提取实际和期望轨迹数据并应用坐标转换"""
+        gt_topic = '/robot1/robot/ground_truth'
+        exp_topic = '/position_exp'
+        
+        if gt_topic in self.current_pose_data:
+            pd = self.current_pose_data[gt_topic]
+            if len(pd.x) > 0:
+                raw = np.column_stack([pd.x, pd.y])
+                self._actual_traj_xy = self.coord_transformer.transform_trajectory(raw)
+        
+        if self.parser and exp_topic in self.parser.get_topic_names():
+            if exp_topic not in self.current_pose_data:
+                try:
+                    pd = self.parser.extract_pose_data(exp_topic)
+                    if pd and len(pd.x) > 0:
+                        self.current_pose_data[exp_topic] = pd
+                except Exception: pass
+        
+        if exp_topic in self.current_pose_data:
+            pd = self.current_pose_data[exp_topic]
+            if len(pd.x) > 0:
+                raw = np.column_stack([pd.x, pd.y])
+                self._expected_traj_xy = self.coord_transformer.transform_trajectory(raw)
+    
+    def _build_trajectory_overlay(self) -> TrajectoryOverlay:
+        """构建轨迹叠加配置"""
+        self._extract_trajectory_data()
+        return TrajectoryOverlay(
+            actual_xy=self._actual_traj_xy,
+            expected_xy=self._expected_traj_xy,
+            show_actual=self.chk_traj_actual.isChecked() and self.chk_traj_all.isChecked(),
+            show_expected=self.chk_traj_expected.isChecked() and self.chk_traj_all.isChecked(),
+            show_all=self.chk_traj_all.isChecked(),
+            actual_color=(0, 0, 1.0),
+            expected_color=(1.0, 0, 0),
+            actual_linewidth=2.0,
+            expected_linewidth=2.0,
+            arrow_interval=5.0,
+            arrow_length=6.0,
+        )
+    
+    def _on_traj_all_toggled(self, checked):
+        self.chk_traj_actual.setEnabled(checked)
+        self.chk_traj_expected.setEnabled(checked)
+        self._on_traj_toggle_changed()
+    
+    def _on_traj_toggle_changed(self):
+        self._save_traj_settings()
+        if (self.global_ogm is not None and self.global_ogm.grid is not None) or \
+           (self.local_ogm is not None and self.local_ogm.grid is not None):
+            self._refresh_ogm_display()
+    
+    def _refresh_ogm_display(self):
+        """刷新占据网格图显示（应用轨迹设置变更）"""
+        overlay = self._build_trajectory_overlay()
+        if self.global_ogm is not None and self.global_ogm.grid is not None and \
+           self.local_ogm is not None and self.local_ogm.grid is not None:
+            self._show_ogm_dual(overlay)
+        elif self.global_ogm is not None and self.global_ogm.grid is not None:
+            center = self._get_gt_position()
+            self._show_ogm_single(self.global_ogm, "全局占据网格图",
+                                  center=center, overlay=overlay)
+        elif self.local_ogm is not None and self.local_ogm.grid is not None:
+            center = self._local_center if hasattr(self, '_local_center') and self._local_center is not None else None
+            self._show_ogm_single(self.local_ogm, "局部占据网格图",
+                                  center=center, overlay=overlay, is_local=True)
+    
+    def _save_traj_settings(self):
+        settings = QSettings("ROSBagAnalyzer", "TrajectorySettings")
+        settings.setValue("show_all", self.chk_traj_all.isChecked())
+        settings.setValue("show_actual", self.chk_traj_actual.isChecked())
+        settings.setValue("show_expected", self.chk_traj_expected.isChecked())
+    
+    def _load_traj_settings(self):
+        settings = QSettings("ROSBagAnalyzer", "TrajectorySettings")
+        self.chk_traj_all.setChecked(settings.value("show_all", True, type=bool))
+        self.chk_traj_actual.setChecked(settings.value("show_actual", True, type=bool))
+        self.chk_traj_expected.setChecked(settings.value("show_expected", True, type=bool))
 
     def build_global_ogm(self):
         pts = self._get_point_cloud()
@@ -925,10 +1031,12 @@ class MainWindow(QMainWindow):
         try:
             self.global_ogm = OccupancyGridMap(config)
             self.global_ogm.build(pts, sensor_positions=sensor_pos)
+            overlay = self._build_trajectory_overlay()
             if self.local_ogm is not None and self.local_ogm.grid is not None:
-                self._show_ogm_dual()
+                self._show_ogm_dual(overlay)
             else:
-                self._show_ogm_single(self.global_ogm, "全局占据网格图", center=center)
+                self._show_ogm_single(self.global_ogm, "全局占据网格图",
+                                      center=center, overlay=overlay)
         except Exception as e:
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
@@ -947,17 +1055,18 @@ class MainWindow(QMainWindow):
         try:
             self.local_ogm = OccupancyGridMap(config)
             self.local_ogm.build_local(pts, center, sensor_position=center)
+            overlay = self._build_trajectory_overlay()
             if self.global_ogm is not None and self.global_ogm.grid is not None:
-                self._show_ogm_dual()
+                self._show_ogm_dual(overlay)
             else:
                 self._show_ogm_single(self.local_ogm,
                     f"局部占据网格图 (中心: {center[0]:.1f}, {center[1]:.1f})",
-                    center=center)
+                    center=center, overlay=overlay, is_local=True)
         except Exception as e:
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
 
-    def _show_ogm_single(self, ogm, title, center=None):
+    def _show_ogm_single(self, ogm, title, center=None, overlay=None, is_local=False):
         if ogm is None or ogm.grid is None:
             return
         self._clear_canvas(self.tab_ogm_lay, 'canvas_ogm', '_toolbar_ogm', self.lbl_ogm_ph)
@@ -965,7 +1074,8 @@ class MainWindow(QMainWindow):
         local_bounds = None
         if ogm is self.global_ogm and self.local_ogm is not None:
             local_bounds = self.local_ogm.local_bounds
-        fig = ogm.visualize(title=title, local_bounds=local_bounds, center=center)
+        fig = ogm.visualize(title=title, local_bounds=local_bounds, center=center,
+                           trajectory_overlay=overlay, is_local=is_local)
         cv = FigureCanvas(fig); cv.setMinimumHeight(400)
         tb = NavigationToolbar(cv, self); tb.setMaximumHeight(35)
         self.tab_ogm_lay.insertWidget(0, tb); self.tab_ogm_lay.insertWidget(1, cv)
@@ -974,20 +1084,15 @@ class MainWindow(QMainWindow):
         stats = ogm.get_statistics()
         self.statusBar().showMessage(
             f"占据网格图已生成 | 占据: {stats.get('occupancy_rate',0):.1f}% | 空闲: {stats.get('free_rate',0):.1f}%")
-        QMessageBox.information(self, "生成完成",
-            f"网格: {stats.get('grid_width',0)}x{stats.get('grid_height',0)}\n"
-            f"占据率: {stats.get('occupancy_rate',0):.1f}%\n"
-            f"空闲率: {stats.get('free_rate',0):.1f}%\n"
-            f"耗时: {stats.get('build_time',0):.3f}s", QMessageBox.Ok)
 
-    def _show_ogm_dual(self):
+    def _show_ogm_dual(self, overlay=None):
         if self.global_ogm is None or self.local_ogm is None:
             return
         if self.global_ogm.grid is None or self.local_ogm.grid is None:
             return
         self._clear_canvas(self.tab_ogm_lay, 'canvas_ogm', '_toolbar_ogm', self.lbl_ogm_ph)
         self.lbl_ogm_ph.hide()
-        fig = self.local_ogm.visualize_dual(self.global_ogm)
+        fig = self.local_ogm.visualize_dual(self.global_ogm, trajectory_overlay=overlay)
         cv = FigureCanvas(fig); cv.setMinimumHeight(400)
         tb = NavigationToolbar(cv, self); tb.setMaximumHeight(35)
         self.tab_ogm_lay.insertWidget(0, tb); self.tab_ogm_lay.insertWidget(1, cv)
@@ -997,10 +1102,6 @@ class MainWindow(QMainWindow):
         l_stats = self.local_ogm.get_statistics()
         self.statusBar().showMessage(
             f"全局+局部占据网格图 | 全局占据: {g_stats.get('occupancy_rate',0):.1f}% | 局部占据: {l_stats.get('occupancy_rate',0):.1f}%")
-        QMessageBox.information(self, "生成完成",
-            f"全局: {g_stats.get('grid_width',0)}x{g_stats.get('grid_height',0)} 占据:{g_stats.get('occupancy_rate',0):.1f}%\n"
-            f"局部: {l_stats.get('grid_width',0)}x{l_stats.get('grid_height',0)} 占据:{l_stats.get('occupancy_rate',0):.1f}%",
-            QMessageBox.Ok)
 
     # ==================== Export ====================
 
@@ -1022,7 +1123,7 @@ class MainWindow(QMainWindow):
     def show_about(self):
         QMessageBox.about(self, "关于",
             "<h2>ROS Bag数据分析与可视化系统</h2>"
-            "<p>版本: 3.1.0</p>"
+            "<p>版本: 3.2.0</p>"
             "<ul>"
             "<li>位姿数据可视化（位置/姿态/2D/3D轨迹）</li>"
             "<li>八叉树地图生成与可视化</li>"
@@ -1039,7 +1140,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName("ROS Bag Analyzer")
-    app.setApplicationVersion("3.1.0")
+    app.setApplicationVersion("3.2.0")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

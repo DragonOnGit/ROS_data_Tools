@@ -112,7 +112,7 @@ class TrajectoryOverlay:
         actual_linewidth: 实际轨迹线宽
         expected_linewidth: 期望轨迹线宽
         arrow_interval: 方向箭头间隔（米）
-        arrow_length: 方向箭头长度（米）
+        arrow_length: 方向箭头长度（像素），3倍线宽=6像素
     """
     actual_xy: Optional[np.ndarray] = None
     expected_xy: Optional[np.ndarray] = None
@@ -747,31 +747,96 @@ class OccupancyGridMap:
                    clip_on=True)
             
             if is_local:
-                ex_pts = overlay.expected_xy
-                mask = (ex_pts[:, 0] >= x_min) & (ex_pts[:, 0] <= x_max) & \
-                       (ex_pts[:, 1] >= y_min) & (ex_pts[:, 1] <= y_max)
-                vis = ex_pts[mask]
-                if len(vis) > 1:
-                    self._draw_direction_arrows(ax, vis, overlay)
+                vis_segments = self._extract_visible_segments(
+                    overlay.expected_xy, x_min, x_max, y_min, y_max)
+                for seg in vis_segments:
+                    if len(seg) > 1:
+                        self._draw_direction_arrows(ax, seg, overlay, extent)
+    
+    def _extract_visible_segments(self, traj: np.ndarray,
+                                  x_min: float, x_max: float,
+                                  y_min: float, y_max: float) -> List[np.ndarray]:
+        """从轨迹中提取视口内的连续段
+        
+        将轨迹按是否在视口内分段，返回所有连续可见段。
+        这避免了布尔掩码过滤后非连续点导致方向计算错误的问题。
+        
+        Args:
+            traj: 完整轨迹坐标 (N, 2)
+            x_min, x_max, y_min, y_max: 视口范围
+            
+        Returns:
+            连续可见段列表，每个元素为 (M, 2) 数组
+        """
+        margin_x = (x_max - x_min) * 0.1
+        margin_y = (y_max - y_min) * 0.1
+        in_view = (
+            (traj[:, 0] >= x_min - margin_x) & (traj[:, 0] <= x_max + margin_x) &
+            (traj[:, 1] >= y_min - margin_y) & (traj[:, 1] <= y_max + margin_y)
+        )
+        
+        segments = []
+        current_seg = []
+        for i, is_vis in enumerate(in_view):
+            if is_vis:
+                current_seg.append(traj[i])
+            else:
+                if len(current_seg) >= 2:
+                    segments.append(np.array(current_seg))
+                current_seg = []
+        if len(current_seg) >= 2:
+            segments.append(np.array(current_seg))
+        
+        return segments
     
     def _draw_direction_arrows(self, ax, vis_pts: np.ndarray,
-                               overlay: 'TrajectoryOverlay') -> None:
+                               overlay: 'TrajectoryOverlay',
+                               extent: list) -> None:
         """在期望轨迹上绘制方向指示箭头
+        
+        使用FancyArrowPatch绘制箭头，箭头长度从像素转换为数据坐标，
+        确保在不同缩放级别下箭头大小一致。
         
         Args:
             ax: matplotlib坐标轴
-            vis_pts: 可见的期望轨迹点
+            vis_pts: 连续可见的期望轨迹点
             overlay: 轨迹叠加配置
+            extent: 图像范围 [x_min, x_max, y_min, y_max]
         """
+        from matplotlib.patches import FancyArrowPatch
+        
         if len(vis_pts) < 2:
             return
+        
+        fig = ax.get_figure()
+        bbox = ax.get_window_extent(fig.canvas.get_renderer() if fig.canvas and hasattr(fig.canvas, 'get_renderer') else None)
+        
+        x_min, x_max, y_min, y_max = extent
+        data_width = x_max - x_min
+        data_height = y_max - y_min
+        
+        if data_width <= 0 or data_height <= 0:
+            return
+        
+        try:
+            dpi = fig.dpi
+            fig_w_inches = fig.get_figwidth()
+            ax_bbox = ax.get_position()
+            ax_w_inches = fig_w_inches * ax_bbox.width
+            pixels_per_meter = ax_w_inches * dpi / data_width
+            arrow_len_data = overlay.arrow_length / pixels_per_meter
+        except Exception:
+            arrow_len_data = data_width * 0.04
+        
+        arrow_len_data = max(arrow_len_data, data_width * 0.02)
+        arrow_len_data = min(arrow_len_data, data_width * 0.08)
         
         diffs = np.diff(vis_pts, axis=0)
         seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
         cum_len = np.concatenate([[0], np.cumsum(seg_lens)])
         total_len = cum_len[-1]
         
-        if total_len < overlay.arrow_interval:
+        if total_len < overlay.arrow_interval * 0.5:
             mid = len(vis_pts) // 2
             if mid > 0:
                 dx = vis_pts[mid, 0] - vis_pts[mid-1, 0]
@@ -779,12 +844,17 @@ class OccupancyGridMap:
                 norm = np.sqrt(dx*dx + dy*dy)
                 if norm > 1e-6:
                     dx /= norm; dy /= norm
-                    al = overlay.arrow_length
-                    ax.annotate('', xy=(vis_pts[mid, 0] + dx*al/2, vis_pts[mid, 1] + dy*al/2),
-                               xytext=(vis_pts[mid, 0] - dx*al/2, vis_pts[mid, 1] - dy*al/2),
-                               arrowprops=dict(arrowstyle='->', color=overlay.expected_color,
-                                              lw=2, mutation_scale=15),
-                               zorder=25)
+                    cx = vis_pts[mid, 0]
+                    cy = vis_pts[mid, 1]
+                    tail = (cx - dx * arrow_len_data / 2, cy - dy * arrow_len_data / 2)
+                    tip = (cx + dx * arrow_len_data / 2, cy + dy * arrow_len_data / 2)
+                    arrow = FancyArrowPatch(
+                        tail, tip,
+                        arrowstyle='->', mutation_scale=15,
+                        color=overlay.expected_color, linewidth=2,
+                        zorder=25, clip_on=True
+                    )
+                    ax.add_patch(arrow)
             return
         
         n_arrows = max(1, int(total_len / overlay.arrow_interval))
@@ -807,12 +877,15 @@ class OccupancyGridMap:
             norm = np.sqrt(dx*dx + dy*dy)
             if norm > 1e-6:
                 dx /= norm; dy /= norm
-                al = overlay.arrow_length
-                ax.annotate('', xy=(px + dx*al/2, py + dy*al/2),
-                           xytext=(px - dx*al/2, py - dy*al/2),
-                           arrowprops=dict(arrowstyle='->', color=overlay.expected_color,
-                                          lw=2, mutation_scale=15),
-                           zorder=25)
+                tail = (px - dx * arrow_len_data / 2, py - dy * arrow_len_data / 2)
+                tip = (px + dx * arrow_len_data / 2, py + dy * arrow_len_data / 2)
+                arrow = FancyArrowPatch(
+                    tail, tip,
+                    arrowstyle='->', mutation_scale=15,
+                    color=overlay.expected_color, linewidth=2,
+                    zorder=25, clip_on=True
+                )
+                ax.add_patch(arrow)
     
     def visualize_dual(self, global_ogm: 'OccupancyGridMap',
                        title: str = '占据网格图 - 全局/局部对比',

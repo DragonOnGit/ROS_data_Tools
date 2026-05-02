@@ -689,6 +689,9 @@ class OccupancyGridMap:
         if trajectory_overlay is not None and trajectory_overlay.show_all:
             self._draw_trajectories(ax, trajectory_overlay, extent, is_local)
         
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        
         if center is not None or (trajectory_overlay is not None and trajectory_overlay.show_all):
             handles, labels = ax.get_legend_handles_labels()
             if handles:
@@ -718,6 +721,9 @@ class OccupancyGridMap:
                            extent: list, is_local: bool) -> None:
         """在坐标轴上绘制轨迹
         
+        绘制策略：绘制全部轨迹点（让matplotlib自动裁剪超出视口的部分），
+        仅在计算方向箭头时提取视口内的连续段，确保轨迹连续不断裂。
+        
         Args:
             ax: matplotlib坐标轴
             overlay: 轨迹叠加配置
@@ -727,28 +733,25 @@ class OccupancyGridMap:
         x_min, x_max, y_min, y_max = extent
         
         if overlay.show_actual and overlay.actual_xy is not None and len(overlay.actual_xy) > 1:
-            ax_pts = overlay.actual_xy
-            mask = (ax_pts[:, 0] >= x_min) & (ax_pts[:, 0] <= x_max) & \
-                   (ax_pts[:, 1] >= y_min) & (ax_pts[:, 1] <= y_max)
-            vis = ax_pts[mask]
-            if len(vis) > 1:
-                ax.plot(vis[:, 0], vis[:, 1], '-',
-                       color=overlay.actual_color,
-                       linewidth=overlay.actual_linewidth,
-                       label='实际轨迹', zorder=20, alpha=0.9)
+            ax.plot(overlay.actual_xy[:, 0], overlay.actual_xy[:, 1], '-',
+                   color=overlay.actual_color,
+                   linewidth=overlay.actual_linewidth,
+                   label='实际轨迹', zorder=20, alpha=0.9,
+                   clip_on=True)
         
         if overlay.show_expected and overlay.expected_xy is not None and len(overlay.expected_xy) > 1:
-            ex_pts = overlay.expected_xy
-            mask = (ex_pts[:, 0] >= x_min) & (ex_pts[:, 0] <= x_max) & \
-                   (ex_pts[:, 1] >= y_min) & (ex_pts[:, 1] <= y_max)
-            vis = ex_pts[mask]
-            if len(vis) > 1:
-                ax.plot(vis[:, 0], vis[:, 1], '--',
-                       color=overlay.expected_color,
-                       linewidth=overlay.expected_linewidth,
-                       label='期望轨迹', zorder=20, alpha=0.9)
-                
-                if is_local:
+            ax.plot(overlay.expected_xy[:, 0], overlay.expected_xy[:, 1], '--',
+                   color=overlay.expected_color,
+                   linewidth=overlay.expected_linewidth,
+                   label='期望轨迹', zorder=20, alpha=0.9,
+                   clip_on=True)
+            
+            if is_local:
+                ex_pts = overlay.expected_xy
+                mask = (ex_pts[:, 0] >= x_min) & (ex_pts[:, 0] <= x_max) & \
+                       (ex_pts[:, 1] >= y_min) & (ex_pts[:, 1] <= y_max)
+                vis = ex_pts[mask]
+                if len(vis) > 1:
                     self._draw_direction_arrows(ax, vis, overlay)
     
     def _draw_direction_arrows(self, ax, vis_pts: np.ndarray,
@@ -901,6 +904,8 @@ class OccupancyGridMap:
         ax1.set_ylabel('Y (m)', fontsize=10)
         ax1.set_title('全局占据网格图', fontsize=12, fontweight='bold')
         ax1.set_aspect('equal')
+        ax1.set_xlim(g_extent[0], g_extent[1])
+        ax1.set_ylim(g_extent[2], g_extent[3])
         ax1.grid(False)
         
         # --- 局部图 ---
@@ -946,6 +951,8 @@ class OccupancyGridMap:
         ax2.set_ylabel('Y (m)', fontsize=10)
         ax2.set_title(f'局部占据网格图 (范围: {self.config.local_range:.1f}m)', fontsize=12, fontweight='bold')
         ax2.set_aspect('equal')
+        ax2.set_xlim(l_extent[0], l_extent[1])
+        ax2.set_ylim(l_extent[2], l_extent[3])
         ax2.grid(False)
         
         fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)

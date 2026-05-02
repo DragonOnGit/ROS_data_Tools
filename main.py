@@ -1037,22 +1037,39 @@ class MainWindow(QMainWindow):
                 if np.any(mask):
                     raw = np.column_stack([pd.x[mask], pd.y[mask]])
                     self._actual_traj_xy = self.coord_transformer.transform_trajectory(raw)
+                    print(f"[OK] 实际轨迹: {np.sum(mask)}/{len(pd.x)} 点 (t<={t_point:.2f}s)")
                 else:
                     self._actual_traj_xy = None
+                    print(f"[WARN] 时间点 {t_point:.2f}s 之前无实际轨迹数据")
         
-        if self.parser and exp_topic in self.parser.get_topic_names():
-            if exp_topic not in self.current_pose_data:
+        if self.parser is not None:
+            topic_names = self.parser.get_topic_names()
+            exp_candidates = [t for t in topic_names if 'position_exp' in t or 'expected' in t or 'reference' in t]
+            if exp_topic not in topic_names and exp_candidates:
+                exp_topic = exp_candidates[0]
+                print(f"[INFO] 使用话题 '{exp_topic}' 作为期望轨迹数据源")
+            
+            if exp_topic in topic_names and exp_topic not in self.current_pose_data:
                 try:
                     pd = self.parser.extract_pose_data(exp_topic)
                     if pd and len(pd.x) > 0:
                         self.current_pose_data[exp_topic] = pd
-                except Exception: pass
+                        print(f"[OK] 期望轨迹数据已提取: {len(pd.x)} 点")
+                    else:
+                        print(f"[WARN] 话题 '{exp_topic}' 提取结果为空")
+                except Exception as e:
+                    print(f"[WARN] 提取期望轨迹失败: {str(e)}")
         
         if exp_topic in self.current_pose_data:
             pd = self.current_pose_data[exp_topic]
             if len(pd.x) > 0:
                 raw = np.column_stack([pd.x, pd.y])
                 self._expected_traj_xy = self.coord_transformer.transform_trajectory(raw)
+                print(f"[OK] 期望轨迹已转换: {len(raw)} 点, 范围 X=[{self._expected_traj_xy[:,0].min():.1f},{self._expected_traj_xy[:,0].max():.1f}] Y=[{self._expected_traj_xy[:,1].min():.1f},{self._expected_traj_xy[:,1].max():.1f}]")
+        else:
+            self._expected_traj_xy = None
+            if self.parser is not None:
+                print(f"[WARN] 未找到期望轨迹话题 (已搜索: /position_exp, *position_exp*, *expected*, *reference*)")
     
     def _build_trajectory_overlay(self) -> TrajectoryOverlay:
         """构建轨迹叠加配置"""

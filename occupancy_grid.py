@@ -249,7 +249,7 @@ class OccupancyGridMap:
     def build_local(self, points: np.ndarray, center: np.ndarray,
                     timestamps: Optional[np.ndarray] = None,
                     sensor_position: Optional[np.ndarray] = None) -> None:
-        """构建局部占据网格图
+        """构建局部占据网格图（从原始点云数据构建）
         
         Args:
             points: 点云数据，形状为(N, 3)
@@ -314,6 +314,103 @@ class OccupancyGridMap:
         print(f"   占据率: {stats['occupancy_rate']:.1f}%")
         print(f"   空闲率: {stats['free_rate']:.1f}%")
         print(f"   耗时: {self._build_time:.3f}s")
+    
+    def extract_local_from_global(self, global_ogm: 'OccupancyGridMap',
+                                  center: np.ndarray,
+                                  local_range: Optional[float] = None) -> bool:
+        """从全局占据网格图中提取局部区域
+        
+        实现"时间→位置→区域地图"三级映射的最后两步：
+        基于给定的中心坐标，从全局地图中提取指定范围的占据图数据，
+        将提取的区域地图内容准确渲染至局部坐标系。
+        
+        Args:
+            global_ogm: 全局占据网格图对象
+            center: 局部地图中心坐标 (x, y)，通常为无人机在地图坐标系中的位置
+            local_range: 局部范围（米），None则使用config中的值
+            
+        Returns:
+            bool: 提取是否成功
+        """
+        start_time = time.time()
+        
+        if global_ogm is None or global_ogm.grid is None:
+            print("[WARN] 全局占据网格图不存在")
+            return False
+        
+        if local_range is None:
+            local_range = self.config.local_range
+        
+        self._local_center = center.copy()
+        self._local_range = local_range
+        
+        half = local_range / 2.0
+        local_x_min = center[0] - half
+        local_x_max = center[0] + half
+        local_y_min = center[1] - half
+        local_y_max = center[1] + half
+        
+        g_res = global_ogm.config.resolution
+        g_origin = global_ogm.origin
+        g_grid = global_ogm.grid
+        g_height, g_width = g_grid.shape
+        
+        g_col_min = int(np.floor((local_x_min - g_origin[0]) / g_res))
+        g_col_max = int(np.ceil((local_x_max - g_origin[0]) / g_res))
+        g_row_min = int(np.floor((local_y_min - g_origin[1]) / g_res))
+        g_row_max = int(np.ceil((local_y_max - g_origin[1]) / g_res))
+        
+        g_col_start = max(0, g_col_min)
+        g_col_end = min(g_width, g_col_max)
+        g_row_start = max(0, g_row_min)
+        g_row_end = min(g_height, g_row_max)
+        
+        l_width = int(np.ceil(local_range / self.config.resolution))
+        l_height = int(np.ceil(local_range / self.config.resolution))
+        
+        self.grid = np.full((l_height, l_width), self.config.unknown_value, dtype=np.int8)
+        self.origin = np.array([local_x_min, local_y_min])
+        
+        if g_col_start >= g_col_end or g_row_start >= g_row_end:
+            self.grid_size = (l_height, l_width)
+            self._build_time = time.time() - start_time
+            print("[WARN] 局部区域超出全局地图范围")
+            return True
+        
+        src = g_grid[g_row_start:g_row_end, g_col_start:g_col_end]
+        
+        l_col_start = g_col_start - g_col_min
+        l_row_start = g_row_start - g_row_min
+        l_col_end = l_col_start + src.shape[1]
+        l_row_end = l_row_start + src.shape[0]
+        
+        l_col_start = max(0, l_col_start)
+        l_row_start = max(0, l_row_start)
+        l_col_end = min(l_width, l_col_end)
+        l_row_end = min(l_height, l_row_end)
+        
+        s_col = l_col_start - (g_col_start - g_col_min)
+        s_row = l_row_start - (g_row_start - g_row_min)
+        
+        copy_h = l_row_end - l_row_start
+        copy_w = l_col_end - l_col_start
+        
+        if copy_h > 0 and copy_w > 0 and s_row >= 0 and s_col >= 0:
+            src_slice = src[s_row:s_row+copy_h, s_col:s_col+copy_w]
+            self.grid[l_row_start:l_row_end, l_col_start:l_col_end] = src_slice
+        
+        self.grid_size = (l_height, l_width)
+        self._build_time = time.time() - start_time
+        
+        stats = self.get_statistics()
+        print(f"[OK] 局部占据网格图提取完成:")
+        print(f"   中心: ({center[0]:.2f}, {center[1]:.2f})")
+        print(f"   范围: {local_range}m x {local_range}m")
+        print(f"   网格尺寸: {self.grid_size[0]} x {self.grid_size[1]}")
+        print(f"   占据率: {stats['occupancy_rate']:.1f}%")
+        print(f"   空闲率: {stats['free_rate']:.1f}%")
+        print(f"   耗时: {self._build_time:.3f}s")
+        return True
     
     def _filter_points(self, points: np.ndarray,
                        timestamps: Optional[np.ndarray] = None) -> np.ndarray:

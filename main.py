@@ -2,7 +2,7 @@
 """
 ROS Bag文件数据处理与可视化系统 - 主程序
 功能：提供图形用户界面，整合所有功能模块
-版本：3.2.0 - 坐标转换 + 轨迹叠加 + 轨迹控制
+版本：3.3.0 - 时空索引 + 局部地图重构 + 轨迹时间过滤
 """
 
 import sys
@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSpinBox, QDoubleSpinBox, QGroupBox, QFormLayout,
                              QMessageBox, QSplitter, QProgressBar, QStatusBar,
                              QAction, QMenu, QMenuBar, QDialog, QLineEdit,
-                             QScrollArea, QCheckBox)
+                             QScrollArea, QCheckBox, QSlider)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
 from PyQt5.QtGui import QIcon, QFont, QTextCursor
 
@@ -106,6 +106,8 @@ class MainWindow(QMainWindow):
         self.coord_transformer = CoordinateTransformer(flip_x=True, flip_y=True)
         self._actual_traj_xy = None
         self._expected_traj_xy = None
+        self._gt_time_range = (0.0, 0.0)
+        self._gt_timestamps = None
 
         self.plot_canvas = None
         self._plot_toolbar = None
@@ -350,12 +352,26 @@ class MainWindow(QMainWindow):
         self.spin_local_range = QDoubleSpinBox(); self.spin_local_range.setRange(1.0, 1000.0)
         self.spin_local_range.setValue(10.0); self.spin_local_range.setSingleStep(1.0)
         gl.addRow("局部范围(m):", self.spin_local_range)
-        self.spin_local_tstart = QDoubleSpinBox(); self.spin_local_tstart.setRange(0, 99999)
-        self.spin_local_tstart.setValue(0); self.spin_local_tstart.setDecimals(2)
-        gl.addRow("时间起点(s):", self.spin_local_tstart)
-        self.spin_local_tend = QDoubleSpinBox(); self.spin_local_tend.setRange(0, 99999)
-        self.spin_local_tend.setValue(99999); self.spin_local_tend.setDecimals(2)
-        gl.addRow("时间终点(s):", self.spin_local_tend)
+        
+        time_sep = QLabel("── 时间点选择 ──")
+        time_sep.setAlignment(Qt.AlignCenter)
+        time_sep.setStyleSheet("color: #888; font-size: 10px;")
+        gl.addRow(time_sep)
+        self.slider_time = QSlider(Qt.Horizontal)
+        self.slider_time.setRange(0, 1000)
+        self.slider_time.setValue(0)
+        self.slider_time.setTickPosition(QSlider.TicksBelow)
+        self.slider_time.setTickInterval(100)
+        self.slider_time.valueChanged.connect(self._on_time_slider_changed)
+        gl.addRow("时间滑块:", self.slider_time)
+        self.spin_time_point = QDoubleSpinBox(); self.spin_time_point.setRange(0, 99999)
+        self.spin_time_point.setValue(0); self.spin_time_point.setDecimals(2)
+        self.spin_time_point.setSingleStep(0.1)
+        self.spin_time_point.valueChanged.connect(self._on_time_spin_changed)
+        gl.addRow("时间点(s):", self.spin_time_point)
+        self.lbl_time_range = QLabel("未加载")
+        self.lbl_time_range.setStyleSheet("color: #888; font-size: 9px;")
+        gl.addRow("数据时间范围:", self.lbl_time_range)
         self.lbl_gt_pos = QLabel("未获取")
         self.lbl_gt_pos.setStyleSheet("color: #666;")
         gl.addRow("无人机位置:", self.lbl_gt_pos)
@@ -679,6 +695,7 @@ class MainWindow(QMainWindow):
             self.list_topics.item(self.list_topics.count()-1).setData(Qt.UserRole, name)
         self._rebuild_topic_buttons()
         self.text_info.setText(parser.get_statistics_report())
+        self._update_time_range()
         QMessageBox.information(self, "加载成功",
             f"发现 {len(parser.topics_info)} 个话题\n旧数据已清除。", QMessageBox.Ok)
 
@@ -914,41 +931,114 @@ class MainWindow(QMainWindow):
             resolution=self.spin_ogm_res.value(),
             height_min=hmin, height_max=hmax,
             occupancy_threshold=self.spin_ogm_occ.value(),
-            local_range=self.spin_local_range.value(),
-            local_time_start=self.spin_local_tstart.value(),
-            local_time_end=self.spin_local_tend.value() if self.spin_local_tend.value() < 99998 else float('inf'))
+            local_range=self.spin_local_range.value())
 
-    def _get_gt_position(self) -> Optional[np.ndarray]:
+    def _ensure_gt_data(self) -> bool:
+        """确保ground_truth数据已加载"""
         gt_topic = '/robot1/robot/ground_truth'
         if gt_topic in self.current_pose_data:
-            pd = self.current_pose_data[gt_topic]
-            if len(pd.x) > 0:
-                self._drone_altitude = pd.z[-1]
-                self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
-                raw = np.array([pd.x[-1], pd.y[-1]])
-                return self.coord_transformer.transform_point(raw)
+            return True
         if self.parser and gt_topic in self.parser.get_topic_names():
             try:
                 pd = self.parser.extract_pose_data(gt_topic)
                 if pd and len(pd.x) > 0:
                     self.current_pose_data[gt_topic] = pd
-                    self._drone_altitude = pd.z[-1]
-                    self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
-                    raw = np.array([pd.x[-1], pd.y[-1]])
-                    return self.coord_transformer.transform_point(raw)
+                    return True
             except Exception: pass
-        return None
+        return False
+
+    def _get_gt_position(self) -> Optional[np.ndarray]:
+        """获取当前时间点对应的无人机位置（地图坐标系）"""
+        gt_topic = '/robot1/robot/ground_truth'
+        if not self._ensure_gt_data():
+            return None
+        pd = self.current_pose_data.get(gt_topic)
+        if pd is None or len(pd.x) == 0:
+            return None
+        t_point = self.spin_time_point.value()
+        idx = np.searchsorted(pd.timestamp, t_point, side='right') - 1
+        idx = max(0, min(idx, len(pd.x) - 1))
+        self._drone_altitude = pd.z[idx]
+        self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
+        raw = np.array([pd.x[idx], pd.y[idx]])
+        return self.coord_transformer.transform_point(raw)
+
+    def _update_time_range(self):
+        """更新时间范围和滑块"""
+        gt_topic = '/robot1/robot/ground_truth'
+        if not self._ensure_gt_data():
+            self.lbl_time_range.setText("未加载")
+            return
+        pd = self.current_pose_data.get(gt_topic)
+        if pd is None or len(pd.timestamp) == 0:
+            self.lbl_time_range.setText("无时间数据")
+            return
+        t_min = float(pd.timestamp[0])
+        t_max = float(pd.timestamp[-1])
+        self._gt_time_range = (t_min, t_max)
+        self._gt_timestamps = pd.timestamp
+        duration = t_max - t_min
+        self.lbl_time_range.setText(f"{t_min:.2f}s ~ {t_max:.2f}s (共{duration:.2f}s)")
+        self.spin_time_point.setRange(t_min, t_max)
+        self.spin_time_point.setValue(t_min)
+        self.slider_time.blockSignals(True)
+        self.slider_time.setRange(0, 1000)
+        self.slider_time.setValue(0)
+        self.slider_time.blockSignals(False)
+
+    def _on_time_slider_changed(self, value):
+        if self._gt_time_range[1] <= self._gt_time_range[0]:
+            return
+        t_min, t_max = self._gt_time_range
+        t_point = t_min + (t_max - t_min) * (value / 1000.0)
+        self.spin_time_point.blockSignals(True)
+        self.spin_time_point.setValue(t_point)
+        self.spin_time_point.blockSignals(False)
+        self._update_position_display(t_point)
+
+    def _on_time_spin_changed(self, value):
+        if self._gt_time_range[1] <= self._gt_time_range[0]:
+            return
+        t_min, t_max = self._gt_time_range
+        ratio = (value - t_min) / max(t_max - t_min, 1e-6)
+        self.slider_time.blockSignals(True)
+        self.slider_time.setValue(int(np.clip(ratio * 1000, 0, 1000)))
+        self.slider_time.blockSignals(False)
+        self._update_position_display(value)
+
+    def _update_position_display(self, t_point):
+        """根据时间点更新无人机位置和高度显示"""
+        gt_topic = '/robot1/robot/ground_truth'
+        pd = self.current_pose_data.get(gt_topic)
+        if pd is None or len(pd.x) == 0:
+            return
+        idx = np.searchsorted(pd.timestamp, t_point, side='right') - 1
+        idx = max(0, min(idx, len(pd.x) - 1))
+        self._drone_altitude = pd.z[idx]
+        self.lbl_gt_alt.setText(f"{self._drone_altitude:.2f}")
+        raw = np.array([pd.x[idx], pd.y[idx]])
+        pos = self.coord_transformer.transform_point(raw)
+        self.lbl_gt_pos.setText(f"({pos[0]:.2f}, {pos[1]:.2f})")
 
     def _extract_trajectory_data(self):
-        """提取实际和期望轨迹数据并应用坐标转换"""
+        """提取实际和期望轨迹数据并应用坐标转换
+        
+        实际轨迹：根据当前时间点截取（从起始到当前时间）
+        期望轨迹：完整显示所有数据
+        """
         gt_topic = '/robot1/robot/ground_truth'
         exp_topic = '/position_exp'
+        t_point = self.spin_time_point.value()
         
         if gt_topic in self.current_pose_data:
             pd = self.current_pose_data[gt_topic]
             if len(pd.x) > 0:
-                raw = np.column_stack([pd.x, pd.y])
-                self._actual_traj_xy = self.coord_transformer.transform_trajectory(raw)
+                mask = pd.timestamp <= t_point
+                if np.any(mask):
+                    raw = np.column_stack([pd.x[mask], pd.y[mask]])
+                    self._actual_traj_xy = self.coord_transformer.transform_trajectory(raw)
+                else:
+                    self._actual_traj_xy = None
         
         if self.parser and exp_topic in self.parser.get_topic_names():
             if exp_topic not in self.current_pose_data:
@@ -1042,9 +1132,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
 
     def build_local_ogm(self):
-        pts = self._get_point_cloud()
-        if pts is None or len(pts) == 0:
-            QMessageBox.warning(self, "无数据", "请先提取点云数据！", QMessageBox.Ok); return
         center = self._get_gt_position()
         if center is None:
             QMessageBox.warning(self, "无位置数据",
@@ -1054,7 +1141,15 @@ class MainWindow(QMainWindow):
         config = self._get_ogm_config()
         try:
             self.local_ogm = OccupancyGridMap(config)
-            self.local_ogm.build_local(pts, center, sensor_position=center)
+            if self.global_ogm is not None and self.global_ogm.grid is not None:
+                self.local_ogm.extract_local_from_global(
+                    self.global_ogm, center, local_range=config.local_range)
+            else:
+                pts = self._get_point_cloud()
+                if pts is None or len(pts) == 0:
+                    QMessageBox.warning(self, "无数据",
+                        "请先生成全局占据网格图，或提取点云数据！", QMessageBox.Ok); return
+                self.local_ogm.build_local(pts, center, sensor_position=center)
             overlay = self._build_trajectory_overlay()
             if self.global_ogm is not None and self.global_ogm.grid is not None:
                 self._show_ogm_dual(overlay)
@@ -1123,7 +1218,7 @@ class MainWindow(QMainWindow):
     def show_about(self):
         QMessageBox.about(self, "关于",
             "<h2>ROS Bag数据分析与可视化系统</h2>"
-            "<p>版本: 3.2.0</p>"
+            "<p>版本: 3.3.0</p>"
             "<ul>"
             "<li>位姿数据可视化（位置/姿态/2D/3D轨迹）</li>"
             "<li>八叉树地图生成与可视化</li>"
@@ -1140,7 +1235,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName("ROS Bag Analyzer")
-    app.setApplicationVersion("3.2.0")
+    app.setApplicationVersion("3.3.0")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

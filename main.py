@@ -2,7 +2,7 @@
 """
 ROS Bag文件数据处理与可视化系统 - 主程序
 功能：提供图形用户界面，整合所有功能模块
-版本：3.3.0 - 时空索引 + 局部地图重构 + 轨迹时间过滤
+版本：3.4.0 - 管道范围 + 数据显示模式
 """
 
 import sys
@@ -108,6 +108,8 @@ class MainWindow(QMainWindow):
         self._expected_traj_xy = None
         self._gt_time_range = (0.0, 0.0)
         self._gt_timestamps = None
+        self._pipe_upper_data = None
+        self._pipe_lower_data = None
 
         self.plot_canvas = None
         self._plot_toolbar = None
@@ -210,6 +212,30 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.pose_btn_container)
         lay.addWidget(tg)
 
+        pipe_g = QGroupBox("📏 管道范围设置")
+        pipe_l = QFormLayout(pipe_g)
+        self.combo_pipe_upper = QComboBox()
+        self.combo_pipe_upper.addItem("未选择", None)
+        self.combo_pipe_upper.currentIndexChanged.connect(self._on_pipe_topic_changed)
+        pipe_l.addRow("管道上界话题:", self.combo_pipe_upper)
+        self.combo_pipe_lower = QComboBox()
+        self.combo_pipe_lower.addItem("未选择", None)
+        self.combo_pipe_lower.currentIndexChanged.connect(self._on_pipe_topic_changed)
+        pipe_l.addRow("管道下界话题:", self.combo_pipe_lower)
+        self.lbl_pipe_status = QLabel("未选择管道话题")
+        self.lbl_pipe_status.setStyleSheet("color: #999; font-size: 9px;")
+        pipe_l.addRow(self.lbl_pipe_status)
+        self.dspin_pipe_alpha = QDoubleSpinBox(); self.dspin_pipe_alpha.setRange(0.05, 1.0)
+        self.dspin_pipe_alpha.setValue(0.3); self.dspin_pipe_alpha.setSingleStep(0.05)
+        pipe_l.addRow("管道透明度:", self.dspin_pipe_alpha)
+        self.spin_pipe_lw = QDoubleSpinBox(); self.spin_pipe_lw.setRange(0.5, 5.0)
+        self.spin_pipe_lw.setValue(1.0); self.spin_pipe_lw.setSingleStep(0.5)
+        pipe_l.addRow("管道线宽:", self.spin_pipe_lw)
+        self.chk_pipe_show = QCheckBox("3D轨迹中显示管道范围")
+        self.chk_pipe_show.setChecked(True)
+        pipe_l.addRow(self.chk_pipe_show)
+        lay.addWidget(pipe_g)
+
         fg = QGroupBox("🔧 滤波设置")
         fl = QFormLayout(fg)
         self.combo_filter = QComboBox()
@@ -239,6 +265,13 @@ class MainWindow(QMainWindow):
 
         pg = QGroupBox("📊 绘图功能")
         pl = QVBoxLayout(pg)
+        dm_l = QHBoxLayout()
+        dm_l.addWidget(QLabel("数据显示:"))
+        self.combo_display_mode = QComboBox()
+        self.combo_display_mode.addItems(['显示滤波数据', '显示原始数据', '同时显示两者'])
+        self.combo_display_mode.setCurrentIndex(2)
+        dm_l.addWidget(self.combo_display_mode)
+        pl.addLayout(dm_l)
         for text, slot in [
             ("📈 绘制位置曲线", self.plot_position),
             ("📊 绘制姿态曲线", self.plot_orientation),
@@ -590,6 +623,51 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "不支持的消息类型",
             f"话题 '{name}' 的消息类型为 '{msg_type}'，\n当前不支持提取。\n\n支持的消息类型：\n{supported}", QMessageBox.Ok)
 
+    def _on_pipe_topic_changed(self):
+        if not self.parser:
+            return
+        upper_topic = self.combo_pipe_upper.currentData()
+        lower_topic = self.combo_pipe_lower.currentData()
+        self._pipe_upper_data = None
+        self._pipe_lower_data = None
+        if upper_topic and upper_topic in self.parser.get_topic_names():
+            try:
+                pd = self.parser.extract_pose_data(upper_topic)
+                if pd and len(pd.x) > 0:
+                    self._pipe_upper_data = pd
+            except Exception: pass
+        if lower_topic and lower_topic in self.parser.get_topic_names():
+            try:
+                pd = self.parser.extract_pose_data(lower_topic)
+                if pd and len(pd.x) > 0:
+                    self._pipe_lower_data = pd
+            except Exception: pass
+        parts = []
+        if self._pipe_upper_data is not None:
+            parts.append(f"上界: {len(self._pipe_upper_data.x)}点")
+        if self._pipe_lower_data is not None:
+            parts.append(f"下界: {len(self._pipe_lower_data.x)}点")
+        if parts:
+            self.lbl_pipe_status.setText(" | ".join(parts))
+            self.lbl_pipe_status.setStyleSheet("color: #2E7D32; font-size: 9px;")
+        else:
+            self.lbl_pipe_status.setText("未选择管道话题")
+            self.lbl_pipe_status.setStyleSheet("color: #999; font-size: 9px;")
+
+    def _populate_pipe_combos(self):
+        if not self.parser:
+            return
+        for combo in [self.combo_pipe_upper, self.combo_pipe_lower]:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("未选择", None)
+            for name in sorted(self.parser.get_topic_names()):
+                info = self.parser.topics_info.get(name)
+                if info and info.msg_type in POSE_MSG_TYPES:
+                    combo.addItem(f"{name} ({info.msg_type})", name)
+            combo.blockSignals(False)
+        self._on_pipe_topic_changed()
+
     def select_map_topic(self, topic_name):
         if not self.parser:
             return
@@ -694,6 +772,7 @@ class MainWindow(QMainWindow):
             self.list_topics.addItem(f"{name}\n  ({info.msg_type}, {info.message_count}条)")
             self.list_topics.item(self.list_topics.count()-1).setData(Qt.UserRole, name)
         self._rebuild_topic_buttons()
+        self._populate_pipe_combos()
         self.text_info.setText(parser.get_statistics_report())
         self._update_time_range()
         QMessageBox.information(self, "加载成功",
@@ -808,36 +887,73 @@ class MainWindow(QMainWindow):
         self.tab_widget.setCurrentIndex(1)
         self.statusBar().showMessage(f"图表已生成: {title}")
 
+    def _get_display_mode(self):
+        idx = self.combo_display_mode.currentIndex()
+        return {0: 'filtered', 1: 'raw', 2: 'both'}.get(idx, 'both')
+
     def plot_position(self):
         if not self.current_pose_data: self._no_data(); return
-        try: self._show_fig(self.visualizer.plot_position_time(show_filtered=True), "位置曲线")
+        mode = self._get_display_mode()
+        try:
+            show_f = mode in ('filtered', 'both')
+            show_r = mode in ('raw', 'both')
+            fig = self.visualizer.plot_position_time(show_filtered=show_f)
+            if not show_r and mode == 'filtered':
+                for ax in fig.get_axes():
+                    lines = [l for l in ax.get_lines() if l.get_linestyle() == '-']
+                    for l in lines:
+                        l.set_visible(False)
+            self._show_fig(fig, "位置曲线")
         except Exception as e: QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
 
     def plot_orientation(self):
         if not self.current_pose_data: self._no_data(); return
-        try: self._show_fig(self.visualizer.plot_orientation_time(show_filtered=True), "姿态曲线")
+        mode = self._get_display_mode()
+        try:
+            show_f = mode in ('filtered', 'both')
+            fig = self.visualizer.plot_orientation_time(show_filtered=show_f)
+            if mode == 'filtered':
+                for ax in fig.get_axes():
+                    for l in ax.get_lines():
+                        if l.get_linestyle() == '-':
+                            l.set_visible(False)
+            self._show_fig(fig, "姿态曲线")
         except Exception as e: QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
 
     def plot_2d(self):
         if not self.current_pose_data: self._no_data(); return
-        try: self._show_fig(self.visualizer.plot_2d_trajectory(show_filtered=True), "2D轨迹")
+        mode = self._get_display_mode()
+        try:
+            show_f = mode in ('filtered', 'both')
+            self._show_fig(self.visualizer.plot_2d_trajectory(show_filtered=show_f), "2D轨迹")
         except Exception as e: QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
 
     def plot_3d(self):
         if not self.current_pose_data: self._no_data(); return
         try:
             from mpl_toolkits.mplot3d import Axes3D
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
             self._clear_canvas(self.tab_3d_lay, 'canvas_3d', '_toolbar_3d', self.lbl_3d_ph)
             self.lbl_3d_ph.hide()
             fig = Figure(figsize=(10,8), dpi=100)
             ax = fig.add_subplot(111, projection='3d')
             colors = ['b','g','r','c','m','y','k','orange','purple']
+            mode = self._get_display_mode()
             for i, (tn, pd) in enumerate(self.current_pose_data.items()):
                 c = colors[i%len(colors)]
                 if len(pd.x) > 0:
-                    ax.plot(pd.x, pd.y, pd.z, color=c, ls='-', label=f'{tn}', lw=1.5, alpha=0.8)
+                    if mode in ('raw', 'both'):
+                        ax.plot(pd.x, pd.y, pd.z, color=c, ls='-', label=f'{tn}', lw=1.5, alpha=0.8)
+                    if mode in ('filtered', 'both') and tn in self.filtered_pose_data:
+                        fp = self.filtered_pose_data[tn]
+                        if len(fp.x) > 0:
+                            ax.plot(fp.x, fp.y, fp.z, color=c, ls='--', label=f'{tn}(滤波)', lw=1.5, alpha=0.8)
                     ax.scatter([pd.x[0]],[pd.y[0]],[pd.z[0]],color=c,marker='o',s=100,zorder=5,edgecolors='k')
                     ax.scatter([pd.x[-1]],[pd.y[-1]],[pd.z[-1]],color=c,marker='s',s=100,zorder=5,edgecolors='k')
+            
+            if self.chk_pipe_show.isChecked() and (self._pipe_upper_data is not None or self._pipe_lower_data is not None):
+                self._draw_3d_pipe(ax)
+            
             ax.set_xlabel('X(m)'); ax.set_ylabel('Y(m)'); ax.set_zlabel('Z(m)')
             ax.legend(fontsize=9); ax.view_init(elev=20, azim=45); fig.tight_layout()
             cv = FigureCanvas(fig); cv.setMinimumHeight(400)
@@ -845,7 +961,47 @@ class MainWindow(QMainWindow):
             self.tab_3d_lay.insertWidget(0, tb); self.tab_3d_lay.insertWidget(1, cv)
             self.canvas_3d = cv; self._toolbar_3d = tb
             self.tab_widget.setCurrentIndex(2)
-        except Exception as e: QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "错误", str(e), QMessageBox.Ok)
+
+    def _draw_3d_pipe(self, ax):
+        """在3D轨迹视图中绘制管道范围"""
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        alpha = self.dspin_pipe_alpha.value()
+        lw = self.spin_pipe_lw.value()
+        
+        upper = self._pipe_upper_data
+        lower = self._pipe_lower_data
+        
+        if upper is not None and lower is not None and len(upper.x) > 1 and len(lower.x) > 1:
+            n = min(len(upper.x), len(lower.x))
+            ux, uy, uz = upper.x[:n], upper.y[:n], upper.z[:n]
+            lx, ly, lz = lower.x[:n], lower.y[:n], lower.z[:n]
+            
+            step = max(1, n // 100)
+            for i in range(0, n - step, step):
+                j = min(i + step, n - 1)
+                verts = [
+                    [ux[i], uy[i], uz[i]],
+                    [ux[j], uy[j], uz[j]],
+                    [lx[j], ly[j], lz[j]],
+                    [lx[i], ly[i], lz[i]],
+                ]
+                poly = Poly3DCollection([verts], alpha=alpha * 0.3,
+                                        facecolor='cyan', edgecolor='teal',
+                                        linewidth=lw * 0.5)
+                ax.add_collection3d(poly)
+            
+            ax.plot(ux, uy, uz, color='teal', ls='-.', lw=lw, alpha=alpha, label='管道上界')
+            ax.plot(lx, ly, lz, color='purple', ls='-.', lw=lw, alpha=alpha, label='管道下界')
+            
+        elif upper is not None and len(upper.x) > 1:
+            ax.plot(upper.x, upper.y, upper.z, color='teal', ls='-.', lw=lw,
+                   alpha=alpha, label='管道上界')
+        elif lower is not None and len(lower.x) > 1:
+            ax.plot(lower.x, lower.y, lower.z, color='purple', ls='-.', lw=lw,
+                   alpha=alpha, label='管道下界')
 
     def plot_dashboard(self):
         if not self.current_pose_data: self._no_data(); return
@@ -1235,7 +1391,7 @@ class MainWindow(QMainWindow):
     def show_about(self):
         QMessageBox.about(self, "关于",
             "<h2>ROS Bag数据分析与可视化系统</h2>"
-            "<p>版本: 3.3.0</p>"
+            "<p>版本: 3.4.0</p>"
             "<ul>"
             "<li>位姿数据可视化（位置/姿态/2D/3D轨迹）</li>"
             "<li>八叉树地图生成与可视化</li>"
@@ -1252,7 +1408,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName("ROS Bag Analyzer")
-    app.setApplicationVersion("3.3.0")
+    app.setApplicationVersion("3.4.0")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
